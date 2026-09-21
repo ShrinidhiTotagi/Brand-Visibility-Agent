@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.db
+*.db-journal
+backups/
+.pytest_cache/
+*.log
+error.log
+stdout.log
+stderr.log
+chroma_db/
+check_tables.py
