@@ -31,6 +31,7 @@ import secrets
 import logging
 import threading
 import datetime
+import decimal
 
 # Load .env file if present (simple key=value parser, no dotenv dependency)
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -202,7 +203,7 @@ def _init_tenants():
         for _ddl in _TENANT_DDL.strip().split(";"):
             _ddl = _ddl.strip()
             if _ddl:
-                db.execute(_ddl)
+                db.execute(_mysqlize_ddl(_ddl))
         # Create default tenant if none exists
         existing = db.query("SELECT COUNT(*) as cnt FROM tenants")
         if existing[0]["cnt"] == 0:
@@ -576,15 +577,46 @@ class DatabaseManager:
     def __init__(self):
         self.db_host = "88.150.227.117"
         self.db_port = 3306
-        self.db_user = "temp_rw"
-        self.db_password = "IYuy56*^"
+        self.db_user = "temp_admin"
+        self.db_password = "hwTU!*83"
         self.db_name = "temp"
-        self.mode = "sqlite"
+        self.mode = "mysql" if os.environ.get("AGENT_DB", "mysql") == "mysql" else "sqlite"
         self.sqlite_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "agent_storage.db")
-        self.flavor = "sqlite"
+        self.flavor = self.mode
+        self._pool = []
+
+    def _strip_strict_mode(self, conn):
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT @@sql_mode")
+            mode = cur.fetchone()
+            if isinstance(mode, dict):
+                mode_str = mode.get("@@sql_mode") or mode.get("@_sql_mode") or ""
+            elif mode:
+                mode_str = mode[0] or ""
+            else:
+                mode_str = ""
+            mode_str = mode_str.replace("STRICT_TRANS_TABLES", "").replace("STRICT_ALL_TABLES", "").strip(", ")
+            if mode_str == "@@sql_mode":
+                mode_str = ""
+            cur.execute("SET SESSION sql_mode=%s", (mode_str,))
+        except Exception:
+            pass
 
     def get_connection(self):
+        if self._pool and self.mode == "mysql":
+            try:
+                conn = self._pool.pop()
+                try:
+                    conn.ping(reconnect=True)
+                except Exception:
+                    conn = None
+                if conn is not None:
+                    self._strip_strict_mode(conn)
+                    return conn
+            except IndexError:
+                pass
         if self.mode == "mysql" and MYSQL_AVAILABLE:
             try:
                 if "mysql.connector" in sys.modules and sys.modules.get("mysql.connector"):
@@ -593,6 +625,7 @@ class DatabaseManager:
                         host=self.db_host, port=self.db_port,
                         user=self.db_user, password=self.db_password,
                         database=self.db_name, autocommit=True,
+                        connection_timeout=10,
                     )
                 else:
                     import pymysql
@@ -601,7 +634,9 @@ class DatabaseManager:
                         user=self.db_user, password=self.db_password,
                         database=self.db_name, autocommit=True,
                         charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor,
+                        connect_timeout=10, read_timeout=30, write_timeout=30,
                     )
+                self._strip_strict_mode(conn)
                 self.flavor = "mysql"
                 return conn
             except Exception as e:
@@ -612,6 +647,18 @@ class DatabaseManager:
         conn.execute("PRAGMA busy_timeout = 30000")
         self.flavor = "sqlite"
         return conn
+
+    def return_connection(self, conn):
+        if self.mode == "mysql" and len(self._pool) < 5:
+            try:
+                self._pool.append(conn)
+                return
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     def ph(self, sql):
         return sql.replace("?", "%s") if self.flavor == "mysql" else sql
@@ -625,7 +672,7 @@ class DatabaseManager:
                 return [dict(r) for r in cur.fetchall()] if cur.description else []
             return [dict(r) for r in cur.fetchall()]
         finally:
-            conn.close()
+            self.return_connection(conn)
 
     def execute(self, sql, params=()):
         conn = self.get_connection()
@@ -637,7 +684,7 @@ class DatabaseManager:
             rid = cur.lastrowid
             return rid
         finally:
-            conn.close()
+            self.return_connection(conn)
 
     def insert(self, sql, params=()):
         return self.execute(sql, params)
@@ -1250,6 +1297,26 @@ def build_ddl(table_name, columns, flavor):
     return "\n".join(lines)
 
 
+def _mysqlize_ddl(ddl):
+    """Convert SQLite DDL to MySQL-compatible DDL. No-op if flavor is sqlite."""
+    if db.flavor != "mysql":
+        return ddl
+    import re as _re
+    d = ddl
+    d = d.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "INT AUTO_INCREMENT PRIMARY KEY")
+    d = d.replace("AUTOINCREMENT", "AUTO_INCREMENT")
+    d = d.replace("TEXT DEFAULT (datetime('now'))", "TEXT DEFAULT NULL")
+    d = _re.sub(r"\bTEXT\s+DEFAULT\s+'([^']*)'", r"VARCHAR(255) DEFAULT '\1'", d)
+    d = _re.sub(r"\bTEXT\s+UNIQUE\b", "VARCHAR(255) UNIQUE", d)
+    d = _re.sub(r"\bTEXT\s+NOT\s+NULL\b", "VARCHAR(255) NOT NULL", d)
+    d = _re.sub(r"\bTEXT\s+PRIMARY\s+KEY\b", "VARCHAR(255) PRIMARY KEY", d)
+    d = _re.sub(r"\bREAL\s+DEFAULT\s+([\d.]+)", r"DOUBLE DEFAULT \1", d)
+    d = d.replace(" trigger ", " `trigger` ")
+    d = d.replace(" key ", " `key` ")
+    d = _re.sub(r",?\s*FOREIGN\s+KEY\s*\([^)]+\)\s*REFERENCES\s+\w+\s*\([^)]+\)", "", d, flags=_re.IGNORECASE)
+    return d
+
+
 def sqlite_tables():
     rows = db.query("SELECT name FROM sqlite_master WHERE type='table'")
     return {r["name"] for r in rows}
@@ -1260,7 +1327,67 @@ def mysql_table_columns(table):
     return {r.get("Field") or r.get("COLUMN_NAME") for r in rows}
 
 
+def mysql_existing_tables():
+    rows = db.query("SHOW TABLES")
+    return {list(r.values())[0] for r in rows}
+
+
+def _fix_mysql_defaults():
+    """ALTER existing MySQL tables to add proper column types/defaults that were stripped during CREATE."""
+    alter_cols = {
+        "agent_activity": [("level", "VARCHAR(255) DEFAULT 'INFO'")],
+        "change_log": [("severity", "VARCHAR(255) DEFAULT 'INFO'")],
+        "analysis_results": [("trigger", "VARCHAR(255) DEFAULT 'MANUAL'")],
+        "recommendations": [("status", "VARCHAR(255) DEFAULT 'PENDING'")],
+        "query_memory": [("status", "VARCHAR(255) DEFAULT 'ACTIVE'")],
+        "evidence": [("verification_status", "VARCHAR(255) DEFAULT 'UNVERIFIED'")],
+        "discovery_candidates": [("status", "VARCHAR(255) DEFAULT 'NEW'")],
+        "jobs": [("status", "VARCHAR(255) DEFAULT 'PENDING'"), ("job_id", "VARCHAR(255)"), ("job_type", "VARCHAR(255) NOT NULL"), ("priority_level", "VARCHAR(255) DEFAULT 'MEDIUM'")],
+        "runs": [("status", "VARCHAR(255) DEFAULT 'RUNNING'"), ("run_type", "VARCHAR(255) DEFAULT 'MANUAL'")],
+        "manager_task_results": [("status", "VARCHAR(255) DEFAULT 'PENDING'")],
+        "learning_memory": [("memory_type", "VARCHAR(255) DEFAULT 'COMPANY_PATTERN'"), ("source", "VARCHAR(255) DEFAULT 'AUTO'"), ("status", "VARCHAR(255) DEFAULT 'ACTIVE'")],
+        "automation_events": [("event_type", "VARCHAR(255) DEFAULT 'UNKNOWN'")],
+    }
+    conn = db.get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SHOW TABLES")
+        existing = {list(r.values())[0] for r in cur.fetchall()}
+        for table_name, cols in alter_cols.items():
+            if table_name not in existing:
+                continue
+            for col_name, col_def in cols:
+                try:
+                    cur.execute("ALTER TABLE `%s` MODIFY COLUMN `%s` %s" % (table_name, col_name, col_def))
+                except Exception:
+                    pass
+    finally:
+        conn.close()
+
+
 def migrate_sqlite():
+    if db.flavor == "mysql":
+        conn = db.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SHOW TABLES")
+            existing = {list(r.values())[0] for r in cur.fetchall()}
+            for table_name, cols in TABLES.items():
+                if table_name not in existing:
+                    continue
+                cur.execute("SHOW COLUMNS FROM `%s`" % table_name)
+                have = {r.get("Field") or r.get("COLUMN_NAME") for r in cur.fetchall()}
+                needed = [c for c, d in cols if c not in have]
+                for c in needed:
+                    for name, sqldef in cols:
+                        if name == c:
+                            try:
+                                cur.execute("ALTER TABLE `%s` ADD COLUMN `%s` %s" % (table_name, name, _mysqlize_ddl(sqldef)))
+                            except Exception as e:
+                                print(f"[Migration] {table_name}.{name} skipped ({e})", flush=True)
+        finally:
+            conn.close()
+        return
     existing = sqlite_tables()
     for table_name, cols in TABLES.items():
         if table_name not in existing:
@@ -1279,9 +1406,23 @@ def migrate_sqlite():
 def init_db():
     for table_name, columns in TABLES.items():
         try:
-            db.execute(build_ddl(table_name, columns, "sqlite"))
+            ddl = build_ddl(table_name, columns, db.flavor)
+            db.execute(_mysqlize_ddl(ddl))
         except Exception as e:
-            print(f"[Schema] SQLite create {table_name} failed: {e}", flush=True)
+            print(f"[Schema] create {table_name} failed: {e}", flush=True)
+
+    if db.flavor == "mysql":
+        try:
+            marked = db.query("SELECT config_key FROM agent_config WHERE config_key='mysql_schema_fixed'")
+            if not marked:
+                _fix_mysql_defaults()
+                db.execute("INSERT INTO agent_config (config_key, config_value, updated_at) VALUES (?,?,?)",
+                           ("mysql_schema_fixed", "1", now()))
+        except Exception:
+            try:
+                _fix_mysql_defaults()
+            except Exception as e:
+                print(f"[Schema] defaults fix failed ({e})", flush=True)
 
     migrate_sqlite()
 
@@ -1289,7 +1430,12 @@ def init_db():
     try:
         db.execute("UPDATE jobs SET status='PENDING' WHERE status='QUEUED' OR status='PENDING_OLD'")
         for r in db.query("SELECT id FROM jobs WHERE job_id IS NULL OR job_id=''"):
-            db.execute("UPDATE jobs SET job_id=? WHERE id=?", (f"JOB-{r['id']:06d}", r["id"]))
+            try:
+                jid = str(r["id"])
+                new_job_id = ("JOB-" + jid.zfill(6)) if jid.isdigit() else ("JOB-" + jid)
+                db.execute("UPDATE jobs SET job_id=? WHERE id=?", (new_job_id, r["id"]))
+            except Exception:
+                pass
     except Exception as e:
         print(f"[Migration] job normalization skipped ({e})", flush=True)
 
@@ -1315,7 +1461,7 @@ def init_db():
         for ddl in _COMPANY_CONFIG_DDL.split(";"):
             ddl = ddl.strip()
             if ddl:
-                db.execute(ddl)
+                db.execute(_mysqlize_ddl(ddl) if db.flavor == "mysql" else ddl)
     except Exception as e:
         print(f"[Schema] company_workflow_config skipped ({e})", flush=True)
 
@@ -14193,8 +14339,23 @@ def build_analysis_result(brand_id, run_id=None):
 # HTTP SERVER
 # ---------------------------------------------------------------------------
 
+class _SafeEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, (datetime.datetime,)):
+            return o.isoformat()
+        if isinstance(o, (datetime.date,)):
+            return o.isoformat()
+        if isinstance(o, (datetime.time,)):
+            return o.isoformat()
+        if isinstance(o, decimal.Decimal):
+            return float(o)
+        if isinstance(o, bytes):
+            return o.decode("utf-8", errors="replace")
+        return super().default(o)
+
+
 def send_json(handler, data, status=200):
-    body = json.dumps(data).encode("utf-8")
+    body = json.dumps(data, cls=_SafeEncoder).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
@@ -14913,7 +15074,6 @@ class AgentServerHandler(BaseHTTPRequestHandler):
                 data = read_body(self)
                 username = data.get("username", "")
                 password = data.get("password", "")
-                # Try tenant user first
                 tu = authenticate_tenant_user(username, password)
                 if tu:
                     token = _create_token(username, tu["role"], tu["tenant_id"], tu["tenant_slug"])
@@ -15751,7 +15911,9 @@ def _ensure_backup_dir():
     os.makedirs(BACKUP_DIR, exist_ok=True)
 
 def create_backup(label="auto"):
-    """Create a timestamped backup of the SQLite database."""
+    """Create a timestamped backup of the database."""
+    if db.flavor == "mysql":
+        return {"success": True, "message": "MySQL backup skipped (use mysqldump)"}
     _ensure_backup_dir()
     ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     backup_path = os.path.join(BACKUP_DIR, f"agent_backup_{label}_{ts}.db")
@@ -15919,7 +16081,7 @@ try:
     for _ddl in _AGENT_MEMORY_DDL.strip().split(";"):
         _ddl = _ddl.strip()
         if _ddl:
-            db.execute(_ddl)
+            db.execute(_mysqlize_ddl(_ddl) if db.flavor == "mysql" else _ddl)
     print("[AgentBrain] Memory tables ready.", flush=True)
 except Exception as _e:
     print(f"[AgentBrain] Memory table init: {_e}", flush=True)
@@ -16771,7 +16933,7 @@ def _wf_init_tables():
         for ddl in _WORKFLOW_DDL.split(";"):
             ddl = ddl.strip()
             if ddl:
-                db.execute(ddl)
+                db.execute(_mysqlize_ddl(ddl) if db.flavor == "mysql" else ddl)
     except Exception as e:
         print(f"[Workflow] table init skipped: {e}", flush=True)
 
