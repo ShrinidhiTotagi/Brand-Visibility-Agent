@@ -4576,7 +4576,7 @@ def validate_orchestrator_action(action):
 
 
 def _latest_job(company_id, job_type):
-    rows = db.query("SELECT * FROM jobs WHERE company_id=? AND job_type=? ORDER BY id DESC LIMIT 1",
+    rows = db.query("SELECT * FROM jobs WHERE company_id=? AND job_type=? ORDER BY created_at DESC, id DESC LIMIT 1",
                     (company_id, job_type))
     return rows[0] if rows else None
 
@@ -4584,7 +4584,7 @@ def _latest_job(company_id, job_type):
 def _completed_after(company_id, job_type, ts):
     """Latest COMPLETED job of type, optionally requiring completion after ts."""
     rows = db.query("SELECT * FROM jobs WHERE company_id=? AND job_type=? AND status='COMPLETED' "
-                    "ORDER BY id DESC LIMIT 1", (company_id, job_type))
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (company_id, job_type))
     if not rows:
         return None
     if ts:
@@ -5521,7 +5521,7 @@ def orchestrator_state():
                     "cycle": sch.get("cycle_count"), "interval_minutes": sch.get("interval_minutes")}
     except Exception:
         sched_st = {"running": False, "paused": False}
-    cur = db.query("SELECT * FROM jobs WHERE status='RUNNING' ORDER BY id DESC LIMIT 1")
+    cur = db.query("SELECT * FROM jobs WHERE status='RUNNING' ORDER BY created_at DESC, id DESC LIMIT 1")
     q = db.query("SELECT status, COUNT(*) AS c FROM jobs GROUP BY status")
     qm = {r["status"]: r["c"] for r in q}
     pending = sum(qm.get(s, 0) for s in ("PENDING", "QUEUED"))
@@ -12966,7 +12966,7 @@ class AgentRunner:
             self._finalize_drained_runs()
 
     def _pick_next_job(self):
-        rows = db.query("SELECT * FROM jobs WHERE status='PENDING' ORDER BY priority DESC, id ASC")
+        rows = db.query("SELECT * FROM jobs WHERE status='PENDING' ORDER BY priority DESC, created_at ASC, id ASC")
         for job in rows:
             if job.get("company_id") and not _deps_satisfied(job["company_id"], job["job_type"]):
                 continue
@@ -12982,7 +12982,7 @@ class AgentRunner:
             jt = job.get("job_type")
             blocked = False
             for dep in JOB_DEPENDENCIES.get(jt, []):
-                d = db.query("SELECT status FROM jobs WHERE company_id=? AND job_type=? ORDER BY id DESC LIMIT 1",
+                d = db.query("SELECT status FROM jobs WHERE company_id=? AND job_type=? ORDER BY created_at DESC, id DESC LIMIT 1",
                              (cid, dep))
                 if d and d[0]["status"] in ("CANCELLED", "FAILED_PERMANENTLY"):
                     blocked = True
@@ -13292,7 +13292,7 @@ def agent_status_detail():
         current_job = None
         rj = db.query("SELECT jb.job_type, jb.company_id, b.brand_name FROM jobs jb "
                       "LEFT JOIN brands b ON b.id=jb.company_id WHERE jb.run_id=? AND jb.status='RUNNING' "
-                      "ORDER BY jb.id DESC LIMIT 1", (run["run_id"],))
+                      "ORDER BY jb.created_at DESC, jb.id DESC LIMIT 1", (run["run_id"],))
         if rj:
             current_job = f"{rj[0]['job_type']}#{rj[0]['company_id']}"
         else:
@@ -13389,11 +13389,11 @@ def agent_status_detail():
 def fetch_jobs(status=None):
     if status and status != "ALL":
         rows = db.query("SELECT j.*, b.brand_name AS company FROM jobs j "
-                        "LEFT JOIN brands b ON b.id=j.company_id WHERE j.status=? ORDER BY j.id DESC LIMIT 300",
+                        "LEFT JOIN brands b ON b.id=j.company_id WHERE j.status=? ORDER BY j.created_at DESC, j.id DESC LIMIT 300",
                         (status,))
     else:
         rows = db.query("SELECT j.*, b.brand_name AS company FROM jobs j "
-                        "LEFT JOIN brands b ON b.id=j.company_id ORDER BY j.id DESC LIMIT 300")
+                        "LEFT JOIN brands b ON b.id=j.company_id ORDER BY j.created_at DESC, j.id DESC LIMIT 300")
     return [dict(r) for r in rows]
 
 
@@ -14966,7 +14966,7 @@ class AgentServerHandler(BaseHTTPRequestHandler):
                                 "j.error, j.retry_count, j.max_retries, j.status, j.created_at, j.completed_at "
                                 "FROM jobs j LEFT JOIN brands b ON b.id=j.company_id "
                                 "WHERE j.status IN ('FAILED','FAILED_PERMANENTLY','RETRYING') "
-                                "ORDER BY j.id DESC LIMIT 100")
+                                "ORDER BY j.created_at DESC, j.id DESC LIMIT 100")
                 send_json(self, {"success": True, "errors": [dict(r) for r in rows]})
             elif path == "/api/automations":
                 cid = (qp.get("company_id") or [None])[0]
@@ -16775,9 +16775,10 @@ class AutonomousAgent:
 
     def _reflect_on_recent(self, cycle_id):
         """Check recent completed jobs and reflect on outcomes."""
+        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(minutes=5)).isoformat(timespec="seconds")
         recent = db.query(
-            "SELECT j.* FROM jobs j WHERE j.status='COMPLETED' AND j.completed_at > datetime('now', '-5 minutes') ORDER BY j.id DESC LIMIT 10"
-        )
+            "SELECT j.* FROM jobs j WHERE j.status='COMPLETED' AND j.completed_at > ? ORDER BY j.created_at DESC, j.id DESC LIMIT 10",
+            (cutoff,))
         for job in recent:
             if not job.get("company_id"):
                 continue
