@@ -656,9 +656,14 @@ class DatabaseManager:
             except Exception as e:
                 print(f"[Database Warning] MySQL unavailable ({e}); using SQLite.", flush=True)
                 self.mode = "sqlite"
-        conn = sqlite3.connect(self.sqlite_path, timeout=30)
+        conn = sqlite3.connect(self.sqlite_path, timeout=60)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout = 30000")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
+        conn.execute("PRAGMA busy_timeout = 60000")
         self.flavor = "sqlite"
         return conn
 
@@ -12971,7 +12976,12 @@ class AgentRunner:
         if cfg.get("startup_auto_run", "1") == "1":
             startup_done = db.query("SELECT config_value FROM agent_config WHERE config_key='startup_done'")
             if not (startup_done and startup_done[0]["config_value"] == "1"):
-                self._start_run("STARTUP", _active_company_ids())
+                try:
+                    first_batch = max(1, int(cfg.get("startup_batch_size", "5")))
+                except Exception:
+                    first_batch = 5
+                cids = [cid for cid in _active_company_ids()][:first_batch]
+                self._start_run("STARTUP", cids)
                 db.execute("INSERT OR REPLACE INTO agent_config (config_key, config_value, updated_at) VALUES (?,?,?)",
                            ("startup_done", "1", now()))
                 return
@@ -12989,27 +12999,71 @@ class AgentRunner:
             days = int(cfg.get("freshness_days", "7"))
         except Exception:
             days = 7
+        try:
+            batch = max(1, int(cfg.get("daily_batch_size", "5")))
+        except Exception:
+            batch = 5
         cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat(timespec="seconds")
-        ids = db.query("SELECT id FROM brands WHERE is_active=1 AND (last_analyzed_at IS NULL OR last_analyzed_at < ?)",
+        ids = db.query("SELECT id FROM brands WHERE is_active=1 AND (last_analyzed_at IS NULL OR last_analyzed_at < ?) "
+                       "ORDER BY last_analyzed_at ASC, id ASC",
                        (cutoff,))
         comp_ids = [r["id"] for r in ids]
-        if comp_ids:
-            self._start_run("DAILY", comp_ids)
+        # Skip companies that already have inflight work; take a bounded
+        # batch (never-analyzed first) so the queue can't flood.
+        fresh = []
+        for cid in comp_ids:
+            try:
+                inflight = db.query("SELECT id FROM jobs WHERE company_id=? "
+                                    "AND status IN ('PENDING','QUEUED','RUNNING','RETRYING') LIMIT 1", (cid,))
+            except Exception:
+                inflight = None
+            if not inflight:
+                fresh.append(cid)
+            if len(fresh) >= batch:
+                break
+        if fresh:
+            self._start_run("DAILY", fresh)
             return True
         return False
 
     def _run_weekly(self):
         last = db.query("SELECT completed_at FROM runs WHERE run_type='WEEKLY' AND status='COMPLETED' "
                         "ORDER BY id DESC LIMIT 1")
+        due = False
         if not last or not last[0]["completed_at"]:
-            self._start_run("WEEKLY", _active_company_ids())
-            return True
-        try:
-            last_dt = datetime.datetime.fromisoformat(last[0]["completed_at"].replace("Z", "+00:00"))
-        except Exception:
+            due = True
+        else:
+            try:
+                last_dt = datetime.datetime.fromisoformat(last[0]["completed_at"].replace("Z", "+00:00"))
+                if datetime.datetime.now(datetime.timezone.utc) - last_dt > datetime.timedelta(days=7):
+                    due = True
+            except Exception:
+                return False
+        if not due:
             return False
-        if datetime.datetime.now(datetime.timezone.utc) - last_dt > datetime.timedelta(days=7):
-            self._start_run("WEEKLY", _active_company_ids())
+        # Bounded batch like daily (never-analyzed first) - weekly waves
+        # cover the fleet without flooding the queue.
+        try:
+            batch = max(1, int(get_config().get("weekly_batch_size", "10")))
+        except Exception:
+            batch = 10
+        ids = db.query("SELECT id FROM brands WHERE is_active=1 "
+                       "ORDER BY last_analyzed_at ASC, id ASC LIMIT ?",
+                       (batch * 2,))
+        comp_ids = []
+        for r in ids:
+            cid = r["id"]
+            try:
+                inflight = db.query("SELECT id FROM jobs WHERE company_id=? "
+                                    "AND status IN ('PENDING','QUEUED','RUNNING','RETRYING') LIMIT 1", (cid,))
+            except Exception:
+                inflight = None
+            if not inflight:
+                comp_ids.append(cid)
+            if len(comp_ids) >= batch:
+                break
+        if comp_ids:
+            self._start_run("WEEKLY", comp_ids)
             return True
         return False
 
