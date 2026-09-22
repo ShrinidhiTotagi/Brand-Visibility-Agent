@@ -14396,14 +14396,18 @@ class _SafeEncoder(json.JSONEncoder):
 
 def send_json(handler, data, status=200):
     body = json.dumps(data, cls=_SafeEncoder).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(body)))
-    origin = handler.headers.get("Origin", "")
-    for k, v in _cors_headers(handler, origin).items():
-        handler.send_header(k, v)
-    handler.end_headers()
-    handler.wfile.write(body)
+    try:
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        origin = handler.headers.get("Origin", "")
+        for k, v in _cors_headers(handler, origin).items():
+            handler.send_header(k, v)
+        handler.end_headers()
+        handler.wfile.write(body)
+    except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+        # Client disconnected mid-response (closed tab, timeout) — not a server error.
+        pass
 
 
 def send_error(handler, message, status=400):
