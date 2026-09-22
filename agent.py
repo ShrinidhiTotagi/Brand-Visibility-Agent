@@ -502,20 +502,20 @@ def default_config():
         "weekly_enabled": "1",
         "weekly_day": "1",
         "weekly_hour": "1",
-        "tick_seconds": "30",
+        "tick_seconds": "10",
         "max_retries": "3",
         "scrape_enabled": "1",
         "ai_observation_queries": "5",
         "ai_observation_limit": "10",
         "reanalysis_on_change_enabled": "1",
-        "query_generation_limit": "10",
+        "query_generation_limit": "20",
         "gemini_queries": "1",
         "evidence_fresh_days": "7",
         "evidence_stale_days": "14",
         "evidence_expired_days": "30",
         "analysis_stale_days": "14",
         "analysis_expired_days": "30",
-        "max_jobs_per_tick": "25",
+        "max_jobs_per_tick": "50",
         # Automation + scheduler (Phase 2). Interval in minutes; the scheduler
         # only CREATES jobs - it never executes analysis itself.
         "scheduler_interval_minutes": "5",
@@ -1909,7 +1909,9 @@ def _query_templates(brand):
 def generate_queries(brand, use_gemini=True):
     """Generate queries. Gemini (if connected) refines/extends; else deterministic templates."""
     suggestions = _query_templates(brand)
-    limit = int(get_config("query_generation_limit", "10"))
+    limit = int(get_config("query_generation_limit", "20"))
+    # Safety cap to prevent Groq rate limit exhaustion
+    limit = min(limit, 50)
     if gemini_available and gemini_model and use_gemini and int(get_config("gemini_queries", "1")):
         try:
             name = brand["brand_name"]
@@ -13042,16 +13044,22 @@ def run_all_companies():
     if not ids:
         return {"success": True, "run_id": None, "companies": 0, "jobs_created": 0,
                 "message": "No companies found."}
+    # Only run core pipeline types for RUN_ALL (skip discovery, etc.)
+    core_pipeline = ["COLLECT_WEBSITE_DATA", "VALIDATE_DATA", "GENERATE_QUERIES", "RUN_AI_SEARCH",
+                     "ANALYZE_BRAND", "ANALYZE_COMPETITORS", "DETECT_CONTENT_GAPS",
+                     "GENERATE_RECOMMENDATIONS", "STORE_ANALYSIS", "UPDATE_LEARNING"]
     rid = create_run("RUN_ALL", companies=ids)
     created = 0
     for cid in ids:
-        for jt in PIPELINE_TYPES:
+        for jt in core_pipeline:
             jid = ensure_job(jt, cid, rid)
             if jid:
                 created += 1
-    log_activity(f"RUN_ALL: {len(ids)} companies, {created} jobs created", level="RUN", run_id=rid)
-    t = threading.Thread(target=lambda: runner._process_queue(run_id=rid), daemon=True, name="run-all")
-    t.start()
+    log_activity(f"RUN_ALL: {len(ids)} companies, {created} jobs created (core pipeline only)", level="RUN", run_id=rid)
+    # Start multiple worker threads for faster processing
+    for _ in range(3):
+        t = threading.Thread(target=lambda: runner._process_queue(run_id=rid), daemon=True, name=f"run-all-worker")
+        t.start()
     return {"success": True, "run_id": rid, "companies": len(ids), "jobs_created": created}
 
 
