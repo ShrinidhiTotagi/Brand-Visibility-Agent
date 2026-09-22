@@ -133,19 +133,23 @@ def _extract_user(handler):
 # ---------------------------------------------------------------------------
 # SECURITY: RATE LIMITER
 # ---------------------------------------------------------------------------
-RATE_LIMIT_PER_MINUTE = 60
+RATE_LIMIT_PER_MINUTE = 300
+RATE_LIMIT_LOGIN_PER_MINUTE = 20
 _rate_buckets = defaultdict(list)
 _rate_lock = threading.Lock()
 
-def _check_rate_limit(ip):
-    """Return True if request is allowed, False if rate limited."""
+def _check_rate_limit(ip, limit=RATE_LIMIT_PER_MINUTE):
+    """Return True if request is allowed, False if rate limited.
+    Buckets are keyed by (ip, limit) so login brute-force protection
+    (strict) is independent from the general API budget (generous)."""
     now = time.time()
     window = now - 60
+    bucket = (ip, limit)
     with _rate_lock:
-        _rate_buckets[ip] = [t for t in _rate_buckets[ip] if t > window]
-        if len(_rate_buckets[ip]) >= RATE_LIMIT_PER_MINUTE:
+        _rate_buckets[bucket] = [t for t in _rate_buckets[bucket] if t > window]
+        if len(_rate_buckets[bucket]) >= limit:
             return False
-        _rate_buckets[ip].append(now)
+        _rate_buckets[bucket].append(now)
         return True
 
 # ---------------------------------------------------------------------------
@@ -15267,8 +15271,8 @@ class AgentServerHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin", "")
         client_ip = self.client_address[0]
 
-        # Rate limit
-        if not _check_rate_limit(client_ip):
+        # Rate limit (login gets its own strict bucket against brute force)
+        if not _check_rate_limit(client_ip, RATE_LIMIT_LOGIN_PER_MINUTE if path == "/api/login" else RATE_LIMIT_PER_MINUTE):
             send_json(self, {"error": "Rate limit exceeded"}, 429)
             return
 
