@@ -674,11 +674,24 @@ class DatabaseManager:
     def ph(self, sql):
         return sql.replace("?", "%s") if self.flavor == "mysql" else sql
 
+    def _fix_reserved(self, sql):
+        # Backtick MySQL reserved words used as column names (trigger, key),
+        # skipping DDL and single-quoted string literals. Safe no-op for SQLite.
+        if self.flavor != "mysql":
+            return sql
+        s = sql.strip().upper()
+        if s.startswith(("CREATE", "ALTER", "DROP", "TRUNCATE")):
+            return sql
+        parts = sql.split("'")
+        for i in range(0, len(parts), 2):
+            parts[i] = re.sub(r"\b(trigger|key)\b", r"`\1`", parts[i], flags=re.IGNORECASE)
+        return "'".join(parts)
+
     def query(self, sql, params=()):
         conn = self.get_connection()
         cur = conn.cursor()
         try:
-            cur.execute(self.ph(sql), params)
+            cur.execute(self.ph(self._fix_reserved(sql)), params)
             if self.flavor == "mysql":
                 return [dict(r) for r in cur.fetchall()] if cur.description else []
             return [dict(r) for r in cur.fetchall()]
@@ -689,7 +702,7 @@ class DatabaseManager:
         conn = self.get_connection()
         cur = conn.cursor()
         try:
-            cur.execute(self.ph(sql), params)
+            cur.execute(self.ph(self._fix_reserved(sql)), params)
             if self.flavor == "sqlite":
                 conn.commit()
             rid = cur.lastrowid
