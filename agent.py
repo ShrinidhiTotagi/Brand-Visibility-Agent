@@ -12820,13 +12820,68 @@ def promote_global_patterns(min_companies=None):
     return {"promoted": promoted}
 
 
-def run_full_pipeline(company_id, trigger="MANUAL", run_id=None):
-    """Entry point: full autonomous-style analysis for a single company."""
+def run_full_pipeline(company_id, trigger="MANUAL", run_id=None, direct=True):
+    """Entry point: full autonomous-style analysis for a single company.
+    direct=True executes the pipeline inline with zero job rows (fast path
+    for manual runs). direct=False uses the persistent job queue (background)."""
     if not run_id:
         run_id = create_run(trigger, companies=[company_id])
-    summary = process_company_jobs(company_id, run_id)
+    if direct:
+        summary = run_company_direct(company_id, run_id)
+    else:
+        summary = process_company_jobs(company_id, run_id)
     finalize_run(run_id, "FAILED" if summary.get("errors") else "COMPLETED")
     return run_id
+
+
+DIRECT_PIPELINE = ["COLLECT_WEBSITE_DATA", "VALIDATE_DATA", "GENERATE_QUERIES", "RUN_AI_SEARCH",
+                   "ANALYZE_BRAND", "ANALYZE_COMPETITORS", "DETECT_CONTENT_GAPS",
+                   "GENERATE_RECOMMENDATIONS", "DETECT_CHANGES", "STORE_ANALYSIS", "UPDATE_LEARNING"]
+
+
+def run_company_direct(company_id, run_id):
+    """Execute the full pipeline inline with zero job-table rows.
+
+    Same step functions the queue workers call (dispatch_job), but no
+    enqueue/dedup/pick/wait hops. Used for manual runs where the user
+    wants results now, not queue position."""
+    ctx = CTX.setdefault((run_id, company_id), {})
+    summary = {"queries": 0, "observations": 0, "new_evidence": 0, "changes": 0,
+               "recommendations": 0, "errors": 0, "steps": []}
+    try:
+        log_activity(f"Direct analysis started for company #{company_id}", level="RUN",
+                     run_id=run_id, company_id=company_id)
+    except Exception:
+        pass
+    for jt in DIRECT_PIPELINE:
+        try:
+            db.execute("UPDATE runs SET current_task=? WHERE run_id=?", (jt, run_id))
+        except Exception:
+            pass
+        try:
+            res = dispatch_job({"job_type": jt, "company_id": company_id, "id": 0}, ctx, run_id) or {}
+            summary["steps"].append({"step": jt, "ok": True})
+            for k in ("queries", "observations", "new_evidence", "changes", "recommendations"):
+                try:
+                    summary[k] += res.get(k, 0) or 0
+                except Exception:
+                    pass
+        except Exception as e:
+            summary["errors"] += 1
+            summary["steps"].append({"step": jt, "ok": False, "error": str(e)[:200]})
+            try:
+                log_activity(f"Direct step {jt} failed for company #{company_id}: {str(e)[:160]}",
+                             level="WARN", run_id=run_id, company_id=company_id)
+            except Exception:
+                pass
+    try:
+        log_activity(f"Direct analysis finished for company #{company_id}: "
+                     f"{summary['queries']} queries, {summary['observations']} obs, "
+                     f"{summary['changes']} changes, {summary['errors']} errors",
+                     level="RUN", run_id=run_id, company_id=company_id)
+    except Exception:
+        pass
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -13041,8 +13096,9 @@ runner = AgentRunner()
 # ---------------------------------------------------------------------------
 
 def run_now(payload, background=True):
-    """RUN AGENT NOW: create a run, find eligible companies from real state,
-    create the required jobs (dedup), then process the queue."""
+    """RUN AGENT NOW: manual runs execute DIRECT (no queue hops) for speed.
+    Spawns a background thread per company and returns immediately; the
+    dashboard polls progress via /agent-state."""
     company_id = payload.get("company_id")
     run_type = payload.get("run_type") or "MANUAL"
     plan = companies_needing_work(company_id)
@@ -13052,47 +13108,74 @@ def run_now(payload, background=True):
         return {"success": True, "run_id": rid, "companies": 0, "jobs_created": 0,
                 "message": "No companies need analysis right now."}
     rid = create_run(run_type, companies=[p["company_id"] for p in plan])
-    created = 0
-    for p in plan:
-        for jt in p["jobs"]:
-            jid = ensure_job(jt, p["company_id"], rid)
-            if jid:
-                created += 1
-    log_activity(f"Run {rid} planned: {len(plan)} company(ies) eligible, {created} job(s) created.", level="RUN",
+    steps = len(DIRECT_PIPELINE) * len(plan)
+    log_activity(f"Run {rid} started (direct): {len(plan)} company(ies), {steps} step(s).", level="RUN",
                  run_id=rid)
+
+    def _go():
+        try:
+            for p in plan:
+                try:
+                    run_company_direct(p["company_id"], rid)
+                except Exception as e:
+                    print(f"[DirectRun] company {p['company_id']} failed: {e}", flush=True)
+        finally:
+            try:
+                finalize_run(rid, "COMPLETED")
+            except Exception:
+                pass
+
     if background:
-        t = threading.Thread(target=lambda: runner._process_queue(run_id=rid), daemon=True, name="run-now")
+        t = threading.Thread(target=_go, daemon=True, name="run-now-direct")
         t.start()
-        return {"success": True, "run_id": rid, "companies": len(plan), "jobs_created": created, "background": True,
-                "plan": plan}
-    runner._process_queue(run_id=rid)
-    return {"success": True, "run_id": rid, "companies": len(plan), "jobs_created": created,
-            "stats": _run_stats(rid)}
+        return {"success": True, "run_id": rid, "companies": len(plan), "jobs_created": steps,
+                "background": True, "mode": "direct", "plan": plan}
+    _go()
+    return {"success": True, "run_id": rid, "companies": len(plan), "jobs_created": steps,
+            "mode": "direct", "stats": _run_stats(rid)}
 
 
 def run_all_companies():
-    """Force-run ALL active companies regardless of freshness."""
+    """Force-run ALL active companies via DIRECT inline execution (no queue).
+    Split across 3 worker threads; returns immediately with the run id."""
     ids = [r["id"] for r in db.query("SELECT id FROM brands WHERE is_active=1")]
     if not ids:
         return {"success": True, "run_id": None, "companies": 0, "jobs_created": 0,
                 "message": "No companies found."}
-    # Only run core pipeline types for RUN_ALL (skip discovery, etc.)
-    core_pipeline = ["COLLECT_WEBSITE_DATA", "VALIDATE_DATA", "GENERATE_QUERIES", "RUN_AI_SEARCH",
-                     "ANALYZE_BRAND", "ANALYZE_COMPETITORS", "DETECT_CONTENT_GAPS",
-                     "GENERATE_RECOMMENDATIONS", "STORE_ANALYSIS", "UPDATE_LEARNING"]
     rid = create_run("RUN_ALL", companies=ids)
-    created = 0
-    for cid in ids:
-        for jt in core_pipeline:
-            jid = ensure_job(jt, cid, rid)
-            if jid:
-                created += 1
-    log_activity(f"RUN_ALL: {len(ids)} companies, {created} jobs created (core pipeline only)", level="RUN", run_id=rid)
-    # Start multiple worker threads for faster processing
-    for _ in range(3):
-        t = threading.Thread(target=lambda: runner._process_queue(run_id=rid), daemon=True, name=f"run-all-worker")
+    steps = len(DIRECT_PIPELINE) * len(ids)
+    log_activity(f"RUN_ALL (direct): {len(ids)} companies, {steps} steps across 3 workers",
+                 level="RUN", run_id=rid)
+
+    def _worker(sub):
+        for cid in sub:
+            try:
+                run_company_direct(cid, rid)
+            except Exception as e:
+                print(f"[RunAll] company {cid} failed: {e}", flush=True)
+
+    def _wait_all(threads):
+        try:
+            for t in threads:
+                t.join(timeout=3600)
+        finally:
+            try:
+                finalize_run(rid, "COMPLETED")
+            except Exception:
+                pass
+
+    chunks = [ids[i::3] for i in range(3)]
+    workers = []
+    for sub in chunks:
+        if not sub:
+            continue
+        t = threading.Thread(target=_worker, args=(sub,), daemon=True, name="run-all-direct")
         t.start()
-    return {"success": True, "run_id": rid, "companies": len(ids), "jobs_created": created}
+        workers.append(t)
+    waiter = threading.Thread(target=_wait_all, args=(workers,), daemon=True, name="run-all-waiter")
+    waiter.start()
+    return {"success": True, "run_id": rid, "companies": len(ids), "jobs_created": steps,
+            "background": True, "mode": "direct"}
 
 
 # ---------------------------------------------------------------------------
@@ -13289,6 +13372,10 @@ def retry_job(job_id):
     return {"success": True, "id": job_id, "status": "PENDING"}
 
 
+_AUTO_SUMMARY_CACHE = {"ts": 0.0, "autos": None, "counts": None,
+                        "monitored": 0, "next_schedule": None}
+
+
 def agent_status_detail():
     """Rich status computed ONLY from real database records + runner state."""
     runs = db.query("SELECT * FROM runs ORDER BY id DESC LIMIT 10")
@@ -13338,9 +13425,20 @@ def agent_status_detail():
             running_cids.add(r["company_id"])
     except Exception:
         pass
-    auto_rows = db.query("SELECT * FROM automations")
-    autos = [dict(r) for r in auto_rows]
-    auto_status_counts = {}
+    # Automation summary is cached ~15s: automations change rarely, but this
+    # endpoint is polled every few seconds by the dashboard.
+    import time as _tmod
+    _now_ts = _tmod.time()
+    _cache = _AUTO_SUMMARY_CACHE
+    if _cache["autos"] is not None and (_now_ts - _cache["ts"]) < 15:
+        autos = _cache["autos"]
+        auto_status_counts = _cache["counts"]
+        companies_monitored = [{"c": _cache["monitored"]}]
+        next_schedule = _cache["next_schedule"]
+    else:
+        auto_rows = db.query("SELECT * FROM automations")
+        autos = [dict(r) for r in auto_rows]
+        auto_status_counts = {}
     for st in AUTOMATION_STATUSES:
         auto_status_counts[st] = 0
     for a in autos:
@@ -13362,6 +13460,14 @@ def agent_status_detail():
             nr = projected_next_run(dict(a))
             if nr and (not next_schedule or nr < next_schedule):
                 next_schedule = nr
+    except Exception:
+        pass
+    try:
+        _cache["autos"] = autos
+        _cache["counts"] = auto_status_counts
+        _cache["monitored"] = companies_monitored[0]["c"] if companies_monitored else 0
+        _cache["next_schedule"] = next_schedule
+        _cache["ts"] = _now_ts
     except Exception:
         pass
     return {
@@ -14049,9 +14155,17 @@ class AutomationScheduler:
                     log_automation_event("AUTOMATION_FAILED", f"ensure schedules #{cid}: {e}", company_id=cid)
 
             if get_config("automation_enabled", "1") == "1":
+                try:
+                    max_create = int(get_config().get("scheduler_max_jobs_per_cycle", "30"))
+                except Exception:
+                    max_create = 30
                 autos = db.query("SELECT a.*, b.brand_name AS company FROM automations a "
                                  "LEFT JOIN brands b ON b.id=a.company_id WHERE a.enabled=1 ORDER BY a.id")
                 for r in autos:
+                    if stats["jobs_created"] >= max_create:
+                        stats["jobs_skipped"] += 1
+                        continue
+                    auto = dict(r)
                     auto = dict(r)
                     stats["automations_checked"] += 1
                     try:
@@ -14093,6 +14207,15 @@ class AutomationScheduler:
         company_id = auto.get("company_id")
         if not get_brand(company_id):
             return {"triggered": False, "reason": "company no longer exists"}
+        # Never stack work on a company that already has inflight jobs.
+        try:
+            inflight = db.query("SELECT id FROM jobs WHERE company_id=? "
+                                "AND status IN ('PENDING','QUEUED','RUNNING','RETRYING') LIMIT 1",
+                                (company_id,))
+            if inflight:
+                return {"triggered": False, "reason": "company already has inflight work"}
+        except Exception:
+            pass
         sched = auto.get("schedule_type", "MANUAL")
         now_dt = datetime.datetime.now(datetime.timezone.utc)
         # MANUAL / event-driven schedules never auto-fire on a timer.
@@ -14350,12 +14473,16 @@ def build_analysis_result(brand_id, run_id=None):
     readiness = safe_json_loads(latest["readiness_breakdown"], {}) if latest else {}
     reasons = safe_json_loads(latest["score_reasons"], []) if latest else []
     analysis_data = safe_json_loads(latest["analysis_data"], {}) if latest else {}
-    brand_analysis = analysis_data.get("brand_analysis") or analyze_brand(brand)
+    # Display path NEVER calls live LLMs (keeps dashboard/PDF instant).
+    # Missing sections render as empty with needs_analysis=True.
+    brand_analysis = analysis_data.get("brand_analysis") or {"positioning": "", "primary_topics": [],
+                                                             "strengths": [], "opportunities": []}
     comps = analysis_data.get("competitor_rows")
     if comps is None:
-        obs = db.query("SELECT * FROM ai_observations WHERE brand_id=? ORDER BY observed_at DESC", (brand_id,))
-        comps = analyze_competitors(brand, obs)
-    gaps = analysis_data.get("content_gaps") or detect_content_gaps(brand, get_company_evidence(brand_id), brand_analysis)
+        obs = db.query("SELECT * FROM ai_observations WHERE brand_id=? ORDER BY observed_at DESC LIMIT 50", (brand_id,))
+        comps = [{"brand": (o.get("brand_name") or ""), "source": "observation",
+                  "visibility": None} for o in obs[:10]] if obs else []
+    gaps = analysis_data.get("content_gaps") or []
     qs = get_active_queries(brand_id)
     query_texts = []
     for q in qs:
@@ -14403,6 +14530,7 @@ def build_analysis_result(brand_id, run_id=None):
         "run_id": run_id,
         "timestamp": now(),
         "version": 2,
+        "needs_analysis": latest is None,
     }
     return money
 
@@ -15317,8 +15445,24 @@ class AgentServerHandler(BaseHTTPRequestHandler):
                 if not bid:
                     send_error(self, "Missing company_id")
                     return
-                rid = run_full_pipeline(int(bid), trigger="REANALYZE")
-                send_json(self, {"success": True, "result": build_analysis_result(int(bid), rid)})
+                # Direct inline execution in background - returns instantly,
+                # dashboard polls live progress via /agent-state.
+                rid = create_run("REANALYZE", companies=[int(bid)])
+
+                def _reanalyze(cid=int(bid), _rid=rid):
+                    try:
+                        summary = run_company_direct(cid, _rid)
+                        finalize_run(_rid, "FAILED" if summary.get("errors") else "COMPLETED")
+                    except Exception as e:
+                        print(f"[ReAnalyze] company {cid} failed: {e}", flush=True)
+                        try:
+                            finalize_run(_rid, "FAILED")
+                        except Exception:
+                            pass
+
+                threading.Thread(target=_reanalyze, daemon=True, name="reanalyze-direct").start()
+                send_json(self, {"success": True, "run_id": rid,
+                                 "message": "Re-analysis started - watch live progress on the dashboard."})
             elif path == "/agent/run-discover":
                 send_json(self, run_company_discovery(read_body(self)))
             elif path == "/companies/import":
@@ -15866,8 +16010,10 @@ def generate_pdf_report(brand_id):
     if not analysis.get("success"):
         return analysis
 
-    score = analysis.get("score", 0)
-    observed = analysis.get("observed_score", 0)
+    score = (analysis.get("visibility_metrics") or {}).get("readiness_score") or 0
+    if not score:
+        score = (analysis.get("visibility_metrics") or {}).get("visibility_score") or 0
+    observed = (analysis.get("visibility_metrics") or {}).get("observed_score") or 0
     recs = analysis.get("recommendations", [])
     evidence = get_company_evidence(brand_id)
     observations = db.query(
@@ -15905,12 +16051,14 @@ th {{ background: #f3f4f6; font-weight: 600; }}
 
     html += f"<h2>AI Observations ({len(observations)})</h2><table><tr><th>Query</th><th>Platform</th><th>Mentioned</th><th>Date</th></tr>"
     for o in observations:
-        html += f"<tr><td>{o.get('query','')}</td><td>{o.get('platform','')}</td><td>{'Yes' if o.get('brand_mentioned') else 'No'}</td><td>{str(o.get('observed_at',''))[:10]}</td></tr>"
+        html += f"<tr><td>{o.get('query_text') or o.get('query') or ''}</td><td>{o.get('provider') or o.get('platform') or ''}</td><td>{'Yes' if o.get('brand_mentioned') else 'No'}</td><td>{str(o.get('observed_at',''))[:10]}</td></tr>"
     html += "</table>"
 
     html += f"<h2>Recommendations ({len(recs)})</h2>"
     for r in recs:
-        html += f"<div class='rec'><strong>{r.get('category','')}</strong>: {r.get('recommendation','')}</div>"
+        title = r.get('title') or r.get('category') or 'Recommendation'
+        desc = r.get('description') or r.get('recommendation') or ''
+        html += f"<div class='rec'><strong>{title}</strong>: {desc}</div>"
 
     html += f"""<div class="footer">Generated by AI Search Visibility Agent v2 | {brand['brand_name']}</div>
 </body></html>"""

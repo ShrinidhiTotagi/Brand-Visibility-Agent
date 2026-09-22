@@ -2197,8 +2197,8 @@
     }
 
     async function reanalyzeCompany(id, btn) {
-        btn.disabled = true; btn.innerText = 'Queuing...';
-        try { await apiPost('/agent/run-company', { company_id: id }); showToast('Re-analysis complete.', 'success'); loadCompanies(); }
+        btn.disabled = true; btn.innerText = 'Running...';
+        try { const r = await apiPost('/agent/run-company', { company_id: id }); showToast('Re-analysis started (' + (r.run_id || '') + '). Live progress on dashboard.', 'success'); setTimeout(loadCompanies, 5000); }
         catch (e) { showToast('Failed: ' + e.message, 'error'); btn.disabled = false; btn.innerText = 'Re-Analyze'; }
     }
 
@@ -3885,8 +3885,15 @@
 
     // ── PDF Report Export ─────────────────────────────────────────────────────
     async function exportPDFReport() {
-        const cid = prompt('Enter Company ID for report:');
-        if (!cid) return;
+        let cid = (currentAnalysis && currentAnalysis.brand_id) || '';
+        if (!cid) {
+            const sel = document.getElementById('evidence-company-select');
+            cid = (sel && sel.value) || '';
+        }
+        if (!cid) {
+            cid = prompt('Enter Company ID for report:');
+            if (!cid) return;
+        }
         try {
             const r = await apiGet(`/api/report/pdf?company_id=${cid}`);
             if (r.success && r.html) {
