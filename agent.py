@@ -385,7 +385,10 @@ groq_available = False
 try:
     if GROQ_API_KEY:
         import groq as _groq_mod
-        groq_client = _groq_mod.Groq(api_key=GROQ_API_KEY)
+        # max_retries=0: SDK must NOT retry internally (it waits 30s+ per
+        # retry and blocks worker threads). Our wrapper does one quick 8s
+        # retry then fails over to templates immediately.
+        groq_client = _groq_mod.Groq(api_key=GROQ_API_KEY, max_retries=0)
         groq_available = True
         print(f"[Groq] Connected ({GROQ_MODEL}).", flush=True)
     else:
