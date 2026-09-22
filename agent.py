@@ -31,6 +31,7 @@ import secrets
 import logging
 import threading
 import datetime
+import uuid
 import decimal
 
 # Load .env file if present (simple key=value parser, no dotenv dependency)
@@ -393,13 +394,23 @@ def _groq_complete(prompt, max_tokens=1024, temperature=0.4):
     """Generate text via Groq. Returns (text, model_name). Raises on failure."""
     if not groq_available or not groq_client:
         raise RuntimeError("Groq not connected")
-    resp = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
-    return (resp.choices[0].message.content or ""), GROQ_MODEL
+    import time as _time
+    for attempt in range(5):
+        try:
+            resp = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return (resp.choices[0].message.content or ""), GROQ_MODEL
+        except Exception as e:
+            if "429" in str(e) or "rate_limit" in str(e).lower():
+                wait = min(60, (2 ** attempt) * 5 + 5)
+                print(f"[Groq] Rate limited, waiting {wait}s (attempt {attempt+1}/5)", flush=True)
+                _time.sleep(wait)
+                continue
+            raise
 
 MYSQL_AVAILABLE = False
 try:
@@ -682,6 +693,12 @@ class DatabaseManager:
             if self.flavor == "sqlite":
                 conn.commit()
             rid = cur.lastrowid
+            # For MySQL with varchar PK, lastrowid is 0; check if this was an INSERT into jobs with UUID
+            if self.flavor == "mysql" and rid == 0 and sql.strip().upper().startswith("INSERT INTO JOBS"):
+                # Try to get the UUID from the params (first param after 'id')
+                for p in params:
+                    if isinstance(p, str) and '-' in p and len(p) == 36:
+                        return p
             return rid
         finally:
             self.return_connection(conn)
@@ -7549,10 +7566,10 @@ def _manager_create_job(task_row, job_type, run_id, parent_job_id=None):
     except Exception:
         brand = None
     jid = db.execute("""
-        INSERT INTO jobs (job_id, company_id, job_type, status, priority, priority_level, payload,
+        INSERT INTO jobs (id, job_id, company_id, job_type, status, priority, priority_level, payload,
                           max_retries, run_id, manager_task_id, assigned_agent_id, parent_job_id, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (new_job_id(0), brand, job_type, "PENDING", 50, "MEDIUM", json.dumps(payload)[:2000],
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (str(uuid.uuid4()), new_job_id(0), brand, job_type, "PENDING", 50, "MEDIUM", json.dumps(payload)[:2000],
           int(get_config().get("max_retries", "3")), run_id, task_row["task_id"],
           task_row.get("selected_agent_id"), parent_job_id, now()))
     db.execute("UPDATE jobs SET job_id=? WHERE id=?", (new_job_id(jid), jid))
@@ -11777,7 +11794,13 @@ INFLIGHT_JOB_STATUSES = ("PENDING", "QUEUED", "RUNNING", "RETRYING", "FAILED")
 
 
 def new_job_id(jid):
-    return f"JOB-{int(jid):06d}"
+    if isinstance(jid, str) and '-' in jid:
+        # UUID string - use last 6 hex chars
+        return f"JOB-{jid.replace('-', '')[-6:].upper()}"
+    try:
+        return f"JOB-{int(jid):06d}"
+    except (ValueError, TypeError):
+        return f"JOB-{abs(hash(str(jid))) % 1000000:06d}"
 
 
 def log_activity(message, level="INFO", run_id=None, job_id=None, company_id=None):
@@ -12071,13 +12094,14 @@ def ensure_job(job_type, company_id, run_id=None, include_completed=True):
     for dep in JOB_DEPENDENCIES.get(job_type, []):
         ensure_job(dep, company_id, run_id, include_completed=include_completed)
     level, reason = compute_priority(company_id, job_type)
+    job_uuid = str(uuid.uuid4())
     jid = db.execute("""
-        INSERT INTO jobs (job_id, company_id, job_type, status, priority, priority_level, payload,
+        INSERT INTO jobs (id, job_id, company_id, job_type, status, priority, priority_level, payload,
                           max_retries, run_id, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
-    """, (new_job_id(0), company_id, job_type, "PENDING", PRIORITY_SCORE.get(level, 50), level,
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    """, (job_uuid, new_job_id(0), company_id, job_type, "PENDING", PRIORITY_SCORE.get(level, 50), level,
           "{}", int(get_config().get("max_retries", "3")), run_id, now()))
-    db.execute("UPDATE jobs SET job_id=? WHERE id=?", (new_job_id(jid), jid))
+    db.execute("UPDATE jobs SET job_id=? WHERE id=?", (new_job_id(jid), job_uuid))
     log_activity(f"Job created: {job_type} for company #{company_id} (priority {level} - {reason})",
                  level="JOB", run_id=run_id, job_id=jid, company_id=company_id)
     return jid
