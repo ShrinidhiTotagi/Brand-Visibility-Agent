@@ -224,13 +224,6 @@ def _init_tenants():
     except Exception as e:
         logger.warning(f"Tenant init: {e}")
 
-def get_tenant_by_slug(slug):
-    rows = db.query("SELECT * FROM tenants WHERE slug=?", (slug,))
-    return dict(rows[0]) if rows else None
-
-def get_tenant_users(tenant_id):
-    return [dict(r) for r in db.query("SELECT id, username, role, created_at FROM tenant_users WHERE tenant_id=?", (tenant_id,))]
-
 def create_tenant(name, slug, plan="starter", max_companies=10):
     api_key = secrets.token_hex(32)
     tid = db.execute(
@@ -252,26 +245,6 @@ def authenticate_tenant_user(username, password):
 # ---------------------------------------------------------------------------
 # USAGE TRACKING & AUDIT LOG
 # ---------------------------------------------------------------------------
-
-def log_usage(tenant_id, user_id, action, resource=None, details=None, ip=None):
-    """Track API usage for billing and analytics."""
-    try:
-        db.execute(
-            "INSERT INTO usage_log (tenant_id, user_id, action, resource, details, ip_address) VALUES (?,?,?,?,?,?)",
-            (tenant_id, user_id, action, resource, json.dumps(details) if details else None, ip))
-    except Exception:
-        pass
-
-def log_audit(tenant_id, user_id, action, entity_type=None, entity_id=None, old_value=None, new_value=None, ip=None):
-    """Track data changes for compliance."""
-    try:
-        db.execute(
-            "INSERT INTO audit_log (tenant_id, user_id, action, entity_type, entity_id, old_value, new_value, ip_address) VALUES (?,?,?,?,?,?,?,?)",
-            (tenant_id, user_id, action, entity_type, entity_id,
-             json.dumps(old_value) if old_value else None,
-             json.dumps(new_value) if new_value else None, ip))
-    except Exception:
-        pass
 
 def get_usage_stats(tenant_id=None, days=30):
     """Get usage statistics for billing."""
@@ -437,10 +410,6 @@ import sqlite3
 
 def now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-
-
-def now_local():
-    return datetime.datetime.now().isoformat(timespec="seconds")
 
 
 def safe_json_loads(text, default=None):
@@ -1361,16 +1330,6 @@ def _mysqlize_ddl(ddl):
 def sqlite_tables():
     rows = db.query("SELECT name FROM sqlite_master WHERE type='table'")
     return {r["name"] for r in rows}
-
-
-def mysql_table_columns(table):
-    rows = db.query("SHOW COLUMNS FROM `%s`" % table)
-    return {r.get("Field") or r.get("COLUMN_NAME") for r in rows}
-
-
-def mysql_existing_tables():
-    rows = db.query("SHOW TABLES")
-    return {list(r.values())[0] for r in rows}
 
 
 def _fix_mysql_defaults():
@@ -3104,18 +3063,6 @@ def ensure_memory(company_id, memory_type, category, key, value, source="AUTO", 
     return rid
 
 
-def get_active_memories(company_id=None, memory_type=None):
-    q = "SELECT * FROM learning_memory WHERE status='ACTIVE'"
-    p = []
-    if company_id is not None:
-        q += " AND company_id=?"
-        p.append(company_id)
-    if memory_type:
-        q += " AND memory_type=?"
-        p.append(memory_type)
-    return db.query(q + " ORDER BY id DESC LIMIT 500", tuple(p))
-
-
 def invalidate_memory(memory_id_or_id, reason, source="USER"):
     """INVALIDATED keeps the row forever; it only stops influencing decisions."""
     rows = db.query("SELECT * FROM learning_memory WHERE memory_id=? OR id=?", (str(memory_id_or_id), memory_id_or_id))
@@ -3589,16 +3536,6 @@ def profile_diff(company_id):
     return diff
 
 
-def _keyword_overlap(a, b):
-    ta = {t.strip().lower() for t in (a or "").split(",") if t.strip()}
-    tb = {t.strip().lower() for t in (b or "").split(",") if t.strip()}
-    if not ta and not tb:
-        return 1.0
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / max(len(ta), len(tb))
-
-
 def classify_change(ch):
     """Deterministic MAJOR/MINOR classification for one change_log row."""
     ct = (ch.get("change_type") or "").upper()
@@ -3723,17 +3660,6 @@ def _decision_confidence(direct_evidence=False, integrations_ok=True, degraded=F
 def _job_time(j):
     """Comparable timestamp for a job row (completion, else creation)."""
     return str((j or {}).get("completed_at") or (j or {}).get("created_at") or "")
-
-
-def _terminal_after(company_id, job_type, ts):
-    """Latest terminal job of type completed after ts (None ts = any terminal)."""
-    rows = db.query("SELECT * FROM jobs WHERE company_id=? AND job_type=? AND status IN "
-                    "('COMPLETED','FAILED_PERMANENTLY','CANCELLED') ORDER BY id DESC LIMIT 5",
-                    (company_id, job_type))
-    for r in rows:
-        if not ts or _job_time(r) > str(ts):
-            return r
-    return None
 
 
 # Hours during which an already-searched-empty query set is not re-searched.
@@ -6268,51 +6194,6 @@ def reason_run_once(company_id):
     return result
 
 
-def orchestrator_decide_with_reasoning(company_id):
-    """Optional reasoning step for the orchestrator (§23): validated reasoning
-    enriches (never replaces) the orchestrator's execution planning. On
-    disagreement the orchestrator action wins; both are reported."""
-    nxt = orchestrator_next_action(company_id)
-    out = {"orchestrator_action": nxt["action"], "priority": nxt.get("priority"),
-           "reason": nxt.get("reason"), "confidence": nxt.get("confidence"),
-           "signals": nxt.get("signals") or [], "agreement": None, "reasoning_id": None}
-    try:
-        if str(get_config("ORCHESTRATOR_USE_REASONING", "0")) != "1":
-            out["reasoning_used"] = False
-            return out
-        r = reason_about_company(company_id, store=False)
-        v = validate_reasoning({**r, "company_id": company_id,
-                                "dependencies": JOB_DEPENDENCIES.get(r.get("recommended_action"), [])})
-        out["reasoning_used"] = True
-        out["reasoning_id"] = r.get("reasoning_id")
-        out["reasoning_action"] = r.get("recommended_action")
-        out["reasoning_reason"] = r.get("reason")
-        out["reasoning_valid"] = v["valid"]
-        if r.get("requires_human_review"):
-            out["action"] = "REQUEST_HUMAN_REVIEW"
-            out["reason"] = r.get("reason")
-            out["agreement"] = "deferred-to-review"
-            return out
-        if not v["valid"]:
-            out["signals"] = out["signals"] + [f"reasoning rejected: {v['reason'][:140]}"]
-            out["agreement"] = "reasoning-invalid"
-            return out
-        if r.get("recommended_action") == nxt["action"]:
-            out["agreement"] = True
-            out["reason"] = nxt.get("reason") + " Reasoning concurs: " + (r.get("reason") or "")[:300]
-            out["reasoning_enriched"] = True
-        else:
-            out["agreement"] = False
-            out["signals"] = out["signals"] + [
-                f"reasoning suggested {r.get('recommended_action')}: {(r.get('reason') or '')[:160]}; "
-                f"orchestrator keeps {nxt['action']}"]
-        return out
-    except Exception as e:
-        out["reasoning_used"] = False
-        out["signals"] = out["signals"] + [f"reasoning error: {str(e)[:140]}"]
-        return out
-
-
 def _reasoning_row(r):
     """Deserialize a reasoning_events row back into the §4 output shape."""
     d = dict(r)
@@ -7859,46 +7740,6 @@ def manager_cancel_task(task_id):
                   {"manager_task_id": top})
     return {"success": True, "task_id": top, "cancelled": cancelled}
 
-
-def manager_retry_task(task_id):
-    """Retry a failed subtask through the EXISTING retry mechanism (§4 test)."""
-    t = _manager_task_row(task_id)
-    if not t:
-        return {"success": False, "error": "Task not found"}
-    j = db.query("SELECT id, status FROM jobs WHERE manager_task_id=? ORDER BY id DESC LIMIT 1", (t["task_id"],))
-    if not j:
-        return {"success": False, "error": "No job for this task yet."}
-    r = retry_job(j[0]["id"])
-    if r.get("success"):
-        db.execute("UPDATE manager_tasks SET status='QUEUED', error_message=NULL WHERE id=?", (t["id"],))
-    return r
-
-
-def manager_sync_task(task_id):
-    """Reconcile one task's status from its jobs' terminal states (persists).
-    FAILED_PERMANENTLY anywhere -> task FAILED; all-jobs terminal with no
-    result is left for the dependency engine; then finalize any parent."""
-    t = _manager_task_row(task_id)
-    if not t:
-        return {"success": False, "error": "Task not found"}
-    jobs = db.query("SELECT status, error FROM jobs WHERE manager_task_id=? ORDER BY id", (t["task_id"],))
-    if not jobs:
-        return {"success": True, "task_id": t["task_id"], "status": t.get("status"), "synced": False}
-    if any(j["status"] == "FAILED_PERMANENTLY" for j in jobs):
-        err = next((j.get("error") or "" for j in jobs if j["status"] == "FAILED_PERMANENTLY"), "")
-        db.execute("UPDATE manager_tasks SET status='FAILED', error_message=?, completed_at=? WHERE id=?",
-                   (f"job failed permanently: {err}"[:500], now(), t["id"]))
-        manager_learn(None, "AGENT_EXECUTION_FAILURE", f"Subtask {t['task_id']} job failed permanently.",
-                      {"manager_task_id": t.get("parent_task_id") or t["task_id"],
-                       "agent_id": t.get("selected_agent_id")})
-        _manager_dependency_check(t.get("parent_task_id") or t["task_id"])
-        _manager_finalize_parent(t.get("parent_task_id") or t["task_id"])
-        return {"success": True, "task_id": t["task_id"], "status": "FAILED", "synced": True}
-    if all(j["status"] == "CANCELLED" for j in jobs) and (t.get("status") or "") not in ("CANCELLED",):
-        db.execute("UPDATE manager_tasks SET status='CANCELLED', completed_at=? WHERE id=?", (now(), t["id"]))
-        return {"success": True, "task_id": t["task_id"], "status": "CANCELLED", "synced": True}
-    return {"success": True, "task_id": t["task_id"], "status": t.get("status"), "synced": False}
-
 def manager_task_display(t):
     """Live display status derived from linked jobs (no writes)."""
     d = dict(t)
@@ -8418,36 +8259,6 @@ def _plan_row(plan_id, version=None):
     return rows[0] if rows else None
 
 
-def plan_set_step_state(plan_id, step_id, status, reason="", version=None):
-    """Advance one step's state (used by orchestrator consumption and tests).
-    Terminal states are sticky: a terminal step cannot leave terminal state."""
-    if status not in PLANNING_STEP_STATUSES:
-        return {"success": False, "error": f"Unknown step status: {status}."}
-    row = _plan_row(plan_id, version)
-    if not row:
-        return {"success": False, "error": "Plan not found"}
-    steps = _plan_steps(row)
-    found = False
-    for s in steps:
-        if s.get("step_id") == step_id:
-            if (s.get("status") or "") in ("COMPLETED", "PARTIAL", "FAILED", "CANCELLED") and status not in (
-                    "COMPLETED", "PARTIAL", "FAILED", "CANCELLED"):
-                return {"success": False, "error": f"Step {step_id} is terminal ({s.get('status')})."}
-            prev = s.get("status")
-            s["status"] = status
-            if reason:
-                s["fail_reason"] = reason[:500]
-            found = True
-            plan_log_event(row["plan_id"], row.get("version"), "STEP_STATE", step_id, prev, status,
-                           reason or f"Step {step_id} -> {status}.", {})
-            break
-    if not found:
-        return {"success": False, "error": f"Step {step_id} not in plan."}
-    db.execute("UPDATE planning_plans SET steps_json=?, updated_at=? WHERE id=?",
-               (json.dumps(steps)[:20000], now(), row["id"]))
-    return {"success": True, "plan_id": row["plan_id"], "step_id": step_id, "status": status}
-
-
 def _plan_steps(row):
     try:
         return safe_json_loads(row.get("steps_json"), []) or []
@@ -8682,39 +8493,6 @@ def _plan_success_conditions(row):
     return (len(unmet) == 0), unmet
 
 
-def plan_needs_replan(plan_id):
-    """Replan triggers (§15): fingerprint drift, failures, new majors,
-    human corrections, or no-progress repetition."""
-    row = _plan_row(plan_id)
-    if not row:
-        return {"replan": False, "reasons": ["plan not found"]}
-    reasons = []
-    try:
-        goal = {"goal_type": row.get("goal_type"), "objective": row.get("objective")}
-        if _plan_fingerprint(goal, row.get("company_id")) != (row.get("context_fingerprint") or ""):
-            reasons.append("context fingerprint changed (evidence/state drift)")
-    except Exception:
-        pass
-    steps = _plan_steps(row)
-    if any((s.get("status") or "") == "FAILED" for s in steps):
-        reasons.append("a plan step failed")
-    try:
-        majors, _ = unprocessed_changes(row.get("company_id"))
-        if majors:
-            reasons.append(f"{len(majors)} unprocessed major change(s)")
-    except Exception:
-        pass
-    try:
-        corr = db.query("SELECT COUNT(*) AS c FROM learning_events WHERE company_id=? AND "
-                        "event_type='EVIDENCE_CORRECTED' AND created_at >= ?",
-                        (row.get("company_id"), row.get("created_at") or "1970-01-01"))[0]["c"]
-        if corr:
-            reasons.append(f"{corr} human correction(s) since planning")
-    except Exception:
-        pass
-    return {"replan": bool(reasons), "reasons": reasons}
-
-
 def plan_no_progress(plan_id):
     """No-progress protection (§16): same fingerprint failing repeatedly. Counts
     consecutive FAILED/PARTIAL versions sharing this plan's fingerprint."""
@@ -8821,35 +8599,6 @@ def plan_suggest_goal_type(objective):
     if any(k in t for k in ("visib", "brand", "presence", "ai search")):
         return {"goal_type": "ANALYZE_VISIBILITY", "confidence": 0.8, "mode": "DETERMINISTIC"}
     return {"goal_type": "CUSTOM_ANALYSIS", "confidence": 0.5, "mode": "DETERMINISTIC"}
-
-
-def orchestrator_consume_plan(plan_id, version=None):
-    """Translate validated READY steps into orchestrator job actions (§24/§35).
-    Observation-only steps map to None (no job); the orchestrator still owns
-    scheduling, dependencies and priority. Pure mapping: creates nothing."""
-    row = _plan_row(plan_id, version)
-    if not row:
-        return {"success": False, "error": "Plan not found"}
-    if (row.get("status") or "") not in ("READY", "RUNNING"):
-        return {"success": False, "error": f"Plan is {row.get('status')}, not consumable."}
-    mapped = []
-    for s in _plan_steps(row):
-        if (s.get("status") or "") == "SKIPPED":
-            mapped.append({"step_id": s["step_id"], "operation": s["operation"],
-                           "job_type": None, "note": f"skipped: {s.get('skip_reason', '')[:160]}"})
-            continue
-        jt = PLAN_OP_TO_JOB.get(s.get("operation"))
-        if jt is None or jt not in JOB_TYPES:
-            mapped.append({"step_id": s["step_id"], "operation": s["operation"],
-                           "job_type": None, "note": "observation-only; no job equivalent"})
-            continue
-        mapped.append({"step_id": s["step_id"], "operation": s["operation"], "job_type": jt,
-                       "depends_on_steps": s.get("depends_on") or [],
-                       "priority": s.get("priority", "MEDIUM"),
-                       "note": "consumable via ensure_job (dedup-aware)"})
-    return {"success": True, "plan_id": row["plan_id"], "version": row.get("version"),
-            "mappings": mapped,
-            "executable": [m for m in mapped if m.get("job_type")]}
 
 
 def plan_dashboard():
@@ -9668,51 +9417,6 @@ def rag_collection():
             embedding_function=_rag_cached_ef)
 
 
-def rag_embed_texts(texts):
-    """Embedding provider health probe (kept for diagnostics; production uses ChromaDB DefaultEmbeddingFunction).
-    Returns (vectors|None, error|None)."""
-    texts = [t for t in (texts or []) if (t or "").strip()]
-    if not texts:
-        return [], None
-    provider = _rag_cfg("RAG_EMBEDDING_PROVIDER", "gemini")
-    model = _rag_cfg("RAG_EMBEDDING_MODEL", "gemini-embedding-001")
-    if provider != "gemini":
-        return None, f"RAG_EMBEDDING_UNAVAILABLE: provider '{provider}' not implemented."
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        out = []
-        import time as _t
-        for t in texts:
-            vec, attempt, delay = None, 0, 5
-            while attempt < 3:
-                try:
-                    r = genai.embed_content(model=f"models/{model}", content=t[:20000])
-                    vec = list(r["embedding"])
-                    _t.sleep(1.0)
-                    break
-                except Exception as e:
-                    msg = str(e)
-                    if attempt >= 2 or not any(k in msg for k in ("429", "quota", "rate", "Rate", "RESOURCE_EXHAUSTED",
-                                                                  "overloaded", "503", "500")):
-                        if "429" in msg or "quota" in msg.lower() or "rate" in msg.lower():
-                            return None, "RAG_EMBEDDING_UNAVAILABLE: embedding quota exhausted."
-                        return None, f"RAG_EMBEDDING_UNAVAILABLE: {msg[:200]}"
-                    _t.sleep(delay)
-                    attempt, delay = attempt + 1, min(delay * 2, 15)
-            if not vec:
-                return None, "RAG_EMBEDDING_UNAVAILABLE: provider returned no vectors."
-            out.append(vec)
-        if not out or len(out[0]) < 10:
-            return None, "RAG_EMBEDDING_UNAVAILABLE: provider returned no vectors."
-        return out, None
-    except Exception as e:
-        msg = str(e)[:300]
-        if "429" in msg or "quota" in msg.lower() or "rate" in msg.lower():
-            return None, "RAG_EMBEDDING_UNAVAILABLE: embedding quota exhausted."
-        return None, f"RAG_EMBEDDING_UNAVAILABLE: {msg}"
-
-
 def _rag_hash(text):
     import hashlib as _hl
     return _hl.sha256((text or "").encode("utf-8", "replace")).hexdigest()[:32]
@@ -10217,28 +9921,6 @@ def rag_health():
             "last_index_at": (last[0].get("t") if last else None), "status": "HEALTHY"}
 
 
-def rag_handle_source_delete(company_id, source_type, record_id):
-    """Source deletion/invalidation (§31): retire vectors, keep event history.
-    Matches by source_record_id only (source_type may have been remapped by collector)."""
-    rows = db.query("SELECT DISTINCT document_id FROM rag_documents WHERE company_id=? "
-                    "AND source_record_id=? AND status='ACTIVE'", (company_id, str(record_id)))
-    try:
-        coll = rag_collection()
-        for r in rows:
-            try:
-                coll.delete(where={"document_id": r["document_id"]})
-            except Exception:
-                pass
-    except Exception:
-        pass
-    for r in rows:
-        db.execute("UPDATE rag_documents SET status='INACTIVE', updated_at=? WHERE document_id=?",
-                   (now(), r["document_id"]))
-        _rag_log_event(r["document_id"], company_id, "DELETED", source_type, str(record_id),
-                       reason="source record deleted or invalidated")
-    return {"success": True, "retired": len(rows)}
-
-
 def retrieve_relevant_context(company_id, query="", top_k=None, filters=None):
     """Real vector retrieval (§23) replacing the deferred keyword-SQL path.
     Same interface so Planning/Reasoning keep working. Falls back to the
@@ -10386,20 +10068,6 @@ def framework_validate_transition(from_state, to_state):
     """Lifecycle gate (§9): only mapped transitions are legal."""
     ok = to_state in FRAMEWORK_TRANSITIONS.get((from_state or "").upper(), ())
     return {"ok": ok, **({} if ok else {"error": f"Illegal transition {(from_state or '')} -> {to_state}."})}
-
-
-def framework_set_task_state(task_id, to_state, reason=""):
-    """Human/system lifecycle moves go through the gate (retry re-queue is the
-    only path out of FAILED). Returns success or a rejection."""
-    t = _manager_task_row(task_id)
-    if not t:
-        return {"success": False, "error": "Task not found"}
-    v = framework_validate_transition(t.get("status"), to_state)
-    if not v["ok"]:
-        return {"success": False, "error": v["error"]}
-    db.execute("UPDATE manager_tasks SET status=?, error_message=? WHERE id=?",
-               (to_state, (reason or "")[:500] or None, t["id"]))
-    return {"success": True, "task_id": t["task_id"], "status": to_state}
 
 
 def _framework_agent_config(agent_row):
@@ -10815,39 +10483,6 @@ def ensure_mcp_tools():
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (tool_id, name, desc, ver, json.dumps(insch), json.dumps(outsch), cap, json.dumps(agents),
               risk, approval, 1, 30, t, t))
-
-
-def mcp_register_tool(tool_def, fn):
-    """Runtime tool registration (validated; duplicates rejected)."""
-    d, errors = (tool_def or {}), []
-    if not re.match(r"^[a-z0-9_]{3,64}$", str(d.get("tool_id") or "")):
-        errors.append("tool_id must be 3-64 chars of lowercase alphanumerics/underscores")
-    if not str(d.get("name") or "").strip():
-        errors.append("name is required")
-    if not isinstance(d.get("input_schema"), dict) or not isinstance(d.get("output_schema"), dict):
-        errors.append("input_schema and output_schema must be objects")
-    if d.get("risk_level", "READ") not in MCP_TOOL_RISKS:
-        errors.append(f"risk_level must be one of {','.join(MCP_TOOL_RISKS)}")
-    if fn is not None and not callable(fn):
-        errors.append("implementation must be callable")
-    if errors:
-        return {"success": False, "errors": errors}
-    if db.query("SELECT id FROM mcp_tools WHERE tool_id=?", (d["tool_id"],)):
-        return {"success": False, "error": f"tool_id '{d['tool_id']}' already registered"}
-    t = now()
-    db.execute("""
-        INSERT INTO mcp_tools (tool_id, name, description, version, input_schema_json, output_schema_json,
-                               capability, agent_ids_json, risk_level, requires_approval, enabled,
-                               timeout_seconds, created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (d["tool_id"], d.get("name"), d.get("description", ""), d.get("version", "1.0.0"),
-          json.dumps(d.get("input_schema", {})), json.dumps(d.get("output_schema", {})),
-          d.get("capability", ""), json.dumps(d.get("agent_ids", [])),
-          d.get("risk_level", "READ"), 1 if d.get("requires_approval") else 0,
-          1 if d.get("enabled", True) else 0, int(d.get("timeout_seconds", 30)), t, t))
-    if fn is not None:
-        MCP_TOOL_IMPLS[d["tool_id"]] = fn
-    return {"success": True, "tool_id": d["tool_id"]}
 
 
 def mcp_list_tools(enabled_only=True):
@@ -11461,15 +11096,6 @@ MCP_TOOL_IMPLS.update({
 })
 
 
-def mcp_register_tool_impl(tool_id, fn):
-    if tool_id not in [t["tool_id"] for t in mcp_list_tools(enabled_only=False)]:
-        return {"success": False, "error": f"tool {tool_id} not registered"}
-    if not callable(fn):
-        return {"success": False, "error": "implementation must be callable"}
-    MCP_TOOL_IMPLS[tool_id] = fn
-    return {"success": True, "tool_id": tool_id}
-
-
 # Job-type -> tool mapping used by the selector (§9/§31). Declared data (the
 # mapping itself is reviewed configuration), never per-request hardcoding.
 JOB_TO_TOOL = {
@@ -11558,82 +11184,11 @@ def mcp_observation(tool_id, result, company_id=None):
             "evidence_ids": ev_ids, "status": (result or {}).get("status")}
 
 
-def mcp_tool_loop(company_id, goal, max_calls=10, client_id="local", auth_token=""):
-    """Bounded agent loop (§10/§12/§31): reason -> select -> validate -> call ->
-    observe -> re-reason. Read/assess tools only; collection stays with the
-    existing orchestrator (proposed, never auto-created here)."""
-    try:
-        max_calls = max(1, min(int(max_calls or 10), int(get_config("MCP_MAX_TOOL_CALLS", "10"))))
-    except Exception:
-        max_calls = 10
-    b = get_brand(company_id)
-    if not b:
-        return {"success": False, "error": f"Unknown company: {company_id}."}
-    observations, calls, seen = [], [], set()
-    final_status, review_note = "COMPLETED", ""
-    for _ in range(max_calls):
-        reasoning = reason_about_company(company_id, store=False)
-        sel = mcp_select_tool(reasoning, observations)
-        if not sel.get("tool_id"):
-            if (reasoning.get("requires_human_review") or
-                    reasoning.get("recommended_action") == "REQUEST_HUMAN_REVIEW"):
-                final_status, review_note = "WAITING_FOR_HUMAN", reasoning.get("reason", "")
-            break
-        args = {"company_id": company_id, "request_id": f"LOOP-{company_id}-{len(calls)}"}
-        if sel["tool_id"] == "run_ai_search":
-            q = db.query("SELECT query_text FROM query_memory WHERE brand_id=? AND is_active=1 "
-                         "ORDER BY id DESC LIMIT 5", (company_id,))
-            tried = {o.get("tool_id") for o in observations}
-            args["query"] = (q[0]["query_text"] if q else "")
-        elif sel["tool_id"] == "compare_snapshots":
-            pass
-        res = mcp_call_tool("ai-search-visibility", sel["tool_id"], args,
-                            client_id=client_id, auth_token=auth_token,
-                            request_id=args["request_id"])
-        if not res.get("success"):
-            observations.append({"type": "EVIDENCE_OBSERVATION", "tool_id": sel["tool_id"],
-                                 "observation": f"Tool rejected: {res.get('error')}: {res.get('reason', '')}",
-                                 "evidence_ids": [], "status": "FAILED"})
-            calls.append({"tool_id": sel["tool_id"], "status": "REJECTED"})
-            continue
-        out = res.get("result") or {}
-        obs = mcp_observation(sel["tool_id"], out, company_id)
-        obs["evidence_ids"] = list(range(len(out.get("evidence") or [])))
-        observations.append(obs)
-        calls.append({"tool_id": sel["tool_id"], "status": out.get("status")})
-        seen.add(sel["tool_id"])
-        if out.get("status") not in ("SUCCESS",):
-            final_status = "PARTIAL"
-    facts = {"company": b.get("brand_name"), "goal": goal, "tools_called": [c["tool_id"] for c in calls]}
-    missing = []
-    try:
-        r2 = reason_about_company(company_id, store=False)
-        missing = r2.get("missing_information") or []
-        if r2.get("requires_human_review"):
-            final_status, review_note = "WAITING_FOR_HUMAN", r2.get("reason", "")
-    except Exception:
-        pass
-    return {"success": True, "company_id": company_id, "goal": goal, "status": final_status,
-            "iterations": len(calls), "observations": observations,
-            "detail": review_note,
-            "final_result": {"FACTS": facts, "OBSERVATIONS": [o["observation"] for o in observations],
-                             "MISSING_INFORMATION": missing,
-                             "RECOMMENDATIONS": [], "EVIDENCE": "see observations"}}
-
-
 def _mcp_resource_limit(limit):
     try:
         return max(1, min(int(limit or 50), 200))
     except Exception:
         return 50
-
-
-def mcp_list_resources():
-    """READ-ONLY resource catalog (§15). URIs are company-scoped templates."""
-    res = ["profile", "evidence", "analysis-history", "snapshots", "changes",
-           "queries", "recommendations", "learning"]
-    return [{"uri": f"company://{{company_id}}/{r}", "name": r,
-             "description": f"Read-only {r.replace('-', ' ')} scoped by company_id."} for r in res]
 
 
 def mcp_read_resource(uri, auth, limit=50):
@@ -11708,10 +11263,6 @@ MCP_PROMPTS = {
     "recommendation_review": ("Review open recommendations for company {company_id} against resolved history; "
                               "never re-propose resolved items."),
 }
-
-
-def mcp_list_prompts():
-    return [{"name": k, "description": v[:160]} for k, v in MCP_PROMPTS.items()]
 
 
 def mcp_get_prompt(name, args, auth):
@@ -12234,10 +11785,6 @@ def _evidence_moved(company_id):
     return True
 
 
-def enqueue_company_jobs(company_id, run_id, priority=None, job_types=None):
-    return plan_company_jobs(company_id, run_id, job_types)
-
-
 def process_company_jobs(company_id, run_id, priority=50):
     """Synchronous job execution for a company (used by manual + re-analyze)."""
     ctx = CTX.setdefault((run_id, company_id), {})
@@ -12491,11 +12038,6 @@ def dispatch_job(job, ctx, run_id):
         return {"ok": True, "planned": len(planned), "existing": True}
 
     return {"skipped": f"unknown job type {jt}"}
-
-
-def mark_success(job_id, result):
-    db.execute("UPDATE jobs SET status='COMPLETED', result_json=?, completed_at=? WHERE id=?",
-               (json.dumps(result).encode("utf-8", "replace").decode("utf-8")[:3000], now(), job_id))
 
 
 def _store_analysis(brand_id, run_id, trigger="MANUAL"):
@@ -13352,23 +12894,6 @@ def update_company_workflow_config(company_id, updates):
     params.append(company_id)
     db.execute(f"UPDATE company_workflow_config SET {', '.join(sets)} WHERE company_id=?", tuple(params))
     return {"success": True, "config": get_company_workflow_config(company_id)}
-
-
-def get_adaptive_queries_for_company(company_id):
-    """Generate queries based on company's workflow preset and industry."""
-    cfg = get_company_workflow_config(company_id)
-    brand = get_brand(company_id)
-    if not brand or not cfg:
-        return []
-    preset = WORKFLOW_PRESETS.get(cfg.get("workflow_preset", "auto"), WORKFLOW_PRESETS["auto"])
-    base_queries = _query_templates(brand)
-    focus = preset.get("focus_areas", [])
-    extra = []
-    for area in focus:
-        extra.append(f"{brand.get('brand_name', '')} {area}")
-    all_q = base_queries + extra
-    limit = preset.get("queries_per_cycle", 5)
-    return all_q[:limit]
 
 
 def detect_offline_website_changes(company_id):
@@ -16195,6 +15720,18 @@ BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
 def _ensure_backup_dir():
     os.makedirs(BACKUP_DIR, exist_ok=True)
 
+def _prune_backups(keep=5):
+    """Delete old backups, keeping only the newest `keep` files."""
+    try:
+        files = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith(".db")], reverse=True)
+        for f in files[keep:]:
+            try:
+                os.remove(os.path.join(BACKUP_DIR, f))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 def create_backup(label="auto"):
     """Create a timestamped backup of the database."""
     if db.flavor == "mysql":
@@ -16207,6 +15744,7 @@ def create_backup(label="auto"):
         shutil.copy2(db.sqlite_path, backup_path)
         size = os.path.getsize(backup_path)
         logger.info(f"Backup created: {backup_path} ({size} bytes)")
+        _prune_backups(keep=5)
         return {"success": True, "path": backup_path, "size": size}
     except Exception as e:
         logger.error(f"Backup failed: {e}")
