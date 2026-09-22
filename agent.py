@@ -1440,8 +1440,9 @@ def init_db():
                 _fix_mysql_defaults()
             except Exception as e:
                 print(f"[Schema] defaults fix failed ({e})", flush=True)
-
-    migrate_sqlite()
+        # Skip migrate_sqlite on MySQL (it's for SQLite schema upgrades only)
+    else:
+        migrate_sqlite()
 
     # Normalize legacy job-status vocabulary (v1 used QUEUED).
     try:
@@ -1456,12 +1457,19 @@ def init_db():
     except Exception as e:
         print(f"[Migration] job normalization skipped ({e})", flush=True)
 
-    # Ensure config + source status rows exist before anything else.
-    for key, val in default_config().items():
-        row = db.query("SELECT config_key FROM agent_config WHERE config_key=?", (key,))
-        if not row:
+    # Ensure config + source status rows exist before anything else (one-time).
+    try:
+        started = db.query("SELECT config_key FROM agent_config WHERE config_key='startup_done'")
+        if not started:
+            for key, val in default_config().items():
+                row = db.query("SELECT config_key FROM agent_config WHERE config_key=?", (key,))
+                if not row:
+                    db.execute("INSERT INTO agent_config (config_key, config_value, updated_at) VALUES (?,?,?)",
+                               (key, val, now()))
             db.execute("INSERT INTO agent_config (config_key, config_value, updated_at) VALUES (?,?,?)",
-                       (key, val, now()))
+                       ("startup_done", "1", now()))
+    except Exception:
+        pass
     # Manager agent registry seed (idempotent; never overwrites operator edits).
     try:
         ensure_registry_seed()
