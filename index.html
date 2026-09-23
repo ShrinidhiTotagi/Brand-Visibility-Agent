@@ -1093,7 +1093,7 @@
         const errEl = document.getElementById('login-error');
         errEl.style.display = 'none';
         try {
-            const r = await fetch('/api/login', {
+            const r = await fetch(apiUrl('/api/login'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ username: user, password: pass })
@@ -1109,7 +1109,7 @@
                 errEl.style.display = 'block';
             }
         } catch (err) {
-            errEl.textContent = 'Connection error';
+            errEl.textContent = 'Cannot reach the agent server' + (API_BASE ? ' at ' + API_BASE : '') + ' - is "python agent.py" running there?';
             errEl.style.display = 'block';
         }
         return false;
@@ -1123,7 +1123,7 @@
     async function checkAuth() {
         if (!AUTH_TOKEN) return false;
         try {
-            const r = await fetch('/api/health', { headers: authHeaders() });
+            const r = await fetch(apiUrl('/api/health'), { headers: authHeaders() });
             return r.ok;
         } catch { return false; }
     }
@@ -1204,14 +1204,22 @@
     }
 
     // ── API helpers ─────────────────────────────────────────────────────────
+    // API_BASE: where the agent backend lives.
+    //   "" (default) = same address as this page (normal setup: page served by the agent).
+    //   If you embedded this page inside another site/portal, set it to the agent, e.g.
+    //   const API_BASE = "http://your-server-ip:8000";
+    //   (Note: browsers block https:// pages calling http:// backends - serve
+    //   the agent behind HTTPS or the same origin in that case.)
+    const API_BASE = "";
+    function apiUrl(path) { return API_BASE + path; }
     async function apiGet(url) {
-        const r = await fetch(url, { headers: authHeaders() });
+        const r = await fetch(apiUrl(url), { headers: authHeaders() });
         if (r.status === 401) { clearAuth(); location.reload(); return; }
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.json();
     }
     async function apiPost(url, body) {
-        const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify(body || {}) });
+        const r = await fetch(apiUrl(url), { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify(body || {}) });
         if (r.status === 401) { clearAuth(); location.reload(); return; }
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));

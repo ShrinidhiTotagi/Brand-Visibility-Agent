@@ -283,7 +283,9 @@ def _cors_headers(handler, origin=None):
 # ---------------------------------------------------------------------------
 # OPTIONAL INTEGRATIONS (disable gracefully when not connected)
 # ---------------------------------------------------------------------------
-
+# Credentials come from environment / .env (never committed to git).
+# For a 2-file server copy, hardcode them here locally (DO NOT git-push
+# hardcoded keys - GitHub secret scanning rejects the push).
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 
@@ -351,6 +353,7 @@ except ImportError:
     print("[requests] NOT CONNECTED - 'requests' package missing.", flush=True)
 
 # ── Groq (free tier: 14,400 req/day) ──────────────────────────────────────
+# Key from environment / .env (never committed - see note above).
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = "qwen/qwen3.8-27b"
 groq_client = None
@@ -17420,7 +17423,20 @@ _wf_init_tables()
 
 
 if __name__ == "__main__":
+    # Port: --port 9000 arg wins, else PORT env, else 8000.
+    # e.g.  python agent.py --port 11301   |   PORT=11301 python agent.py
     port = 8000
+    try:
+        import sys as _sys
+        for _i, _a in enumerate(_sys.argv[1:]):
+            if _a == "--port" and _i + 2 <= len(_sys.argv[1:]):
+                port = int(_sys.argv[1:][_i + 1])
+            elif _a.startswith("--port="):
+                port = int(_a.split("=", 1)[1])
+        if "--port" not in _sys.argv[1:] and not any(a.startswith("--port=") for a in _sys.argv[1:]):
+            port = int(os.environ.get("PORT", "8000"))
+    except Exception:
+        port = 8000
     start_server(port)
 
 
