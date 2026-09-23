@@ -291,8 +291,12 @@
             <div><div class="brand-name">VisibilityAI</div><div class="brand-sub">Autonomous v2</div></div>
         </div>
         <ul class="nav-menu">
+            <li class="nav-item active" data-view="start" onclick="switchView('start')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M5 3l14 7-14 7V3z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                <span>Start</span>
+            </li>
             <li class="nav-label">AGENT</li>
-            <li class="nav-item active" data-view="control" onclick="switchView('control')">
+            <li class="nav-item" data-view="control" onclick="switchView('control')">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M7 20h10M12 16v4" stroke-linecap="round"/><circle cx="9" cy="10" r="1.2" fill="currentColor" stroke="none"/><circle cx="15" cy="10" r="1.2" fill="currentColor" stroke="none"/></svg>
                 <span>Agent Control</span>
             </li>
@@ -382,8 +386,73 @@
         </header>
         <div class="content-area">
 
+            <!-- START (simple: Region to Result) -->
+            <section id="start-view" class="view-panel active">
+                <div class="card" style="max-width:1000px;margin:0 auto 20px auto;">
+                    <div class="card-header"><div>
+                        <div class="card-title">1 · Region & Discovery</div>
+                        <div class="card-subtitle">Pick a region, discover real companies from public sources</div>
+                    </div></div>
+                    <div class="form-grid">
+                        <div class="form-group"><label>Region</label><select id="start-region"><option value="">Select Region...</option></select></div>
+                        <div class="form-group"><label>Industry</label><input type="text" id="start-industry" placeholder="e.g. Fintech"></div>
+                    </div>
+                    <button class="btn-primary btn-block" onclick="startDiscover()">Discover Companies</button>
+                    <div id="start-disc-counts" style="margin-top:12px;"></div>
+                    <div id="start-candidates" style="margin-top:8px;"></div>
+                </div>
+
+                <div class="card" style="max-width:1000px;margin:0 auto 20px auto;">
+                    <div class="card-header"><div>
+                        <div class="card-title">2 · Company & Workflow</div>
+                        <div class="card-subtitle">Pick a company, pick a workflow, run</div>
+                    </div></div>
+                    <div class="form-grid">
+                        <div class="form-group"><label>Company</label><select id="start-company"><option value="">Select company...</option></select></div>
+                        <div class="form-group"><label>Workflow</label><select id="start-workflow" onchange="startWorkflowChanged()"></select></div>
+                    </div>
+                    <div id="start-diagram" style="margin:14px 0;padding:12px;background:var(--bg-secondary);border-radius:8px;font-size:0.9rem;"></div>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                        <button class="btn-primary" id="start-run-btn" onclick="startRunCompany()">▶ Run Analysis</button>
+                        <button class="btn-secondary" id="start-mon-btn" onclick="startToggleMonitoring()">Automatic Monitoring: …</button>
+                    </div>
+                </div>
+
+                <div class="card" style="max-width:1000px;margin:0 auto 20px auto;">
+                    <div class="card-header"><div>
+                        <div class="card-title">3 · Live Status</div>
+                        <div class="card-subtitle">Actual runtime state, refreshed automatically</div>
+                    </div></div>
+                    <div id="start-live"><div class="form-hint">Loading…</div></div>
+                </div>
+
+                <div class="card" style="max-width:1000px;margin:0 auto 20px auto;">
+                    <div class="card-header"><div>
+                        <div class="card-title">4 · Last Result</div>
+                        <div class="card-subtitle">Latest stored analysis with evidence</div>
+                    </div></div>
+                    <div id="start-result"><div class="form-hint">Run an analysis to see results here.</div></div>
+                </div>
+
+                <div class="card" style="max-width:1000px;margin:0 auto 20px auto;">
+                    <div class="card-header"><div>
+                        <div class="card-title">Execution Details</div>
+                        <div class="card-subtitle">Real step-by-step events from the selected workflow runs</div>
+                    </div></div>
+                    <div id="start-exec"><div class="form-hint">No runs yet for this company.</div></div>
+                </div>
+
+                <div class="card" style="max-width:1000px;margin:0 auto;">
+                    <div class="card-header"><div>
+                        <div class="card-title">System Health</div>
+                        <div class="card-subtitle">Every flag comes from a live check</div>
+                    </div></div>
+                    <div id="start-health" style="display:flex;gap:8px;flex-wrap:wrap;"><div class="form-hint">Checking…</div></div>
+                </div>
+            </section>
+
             <!-- AGENT CONTROL -->
-            <section id="control-view" class="view-panel active">
+            <section id="control-view" class="view-panel">
                 <div id="control-body"><div class="empty-state">Loading agent state...</div></div>
             </section>
 
@@ -1052,6 +1121,7 @@
     let controlPollTimer = null;
 
     const NAV_TITLES = {
+        'start': 'Start - Region to Result',
         'control': 'Agent Control - Autonomous Intelligence',
         'new-analysis': 'Configure Brand Visibility Audit',
         'dashboard': 'Visibility Report (Readiness vs Observed)',
@@ -1133,7 +1203,7 @@
         checkOnboarding();
         const hash = location.hash.replace('#', '');
         if (hash && NAV_TITLES[hash]) switchView(hash);
-        else switchView('control');
+        else switchView('start');
     }
 
     // ── Onboarding Wizard ────────────────────────────────────────────────────
@@ -1239,6 +1309,7 @@
     // ── View switching ──────────────────────────────────────────────────────
     function switchView(viewId) {
         if (controlPollTimer) { clearInterval(controlPollTimer); controlPollTimer = null; }
+        if (window.startPollTimer) { clearInterval(window.startPollTimer); window.startPollTimer = null; }
         document.querySelectorAll('.view-panel').forEach(p => p.classList.remove('active'));
         document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
         const panel = document.getElementById(viewId + '-view');
@@ -1251,6 +1322,7 @@
             loadAgentState();
             controlPollTimer = setInterval(loadAgentState, 3500);
         }
+        else if (viewId === 'start') loadStart();
         else if (viewId === 'dashboard') loadDashboardData();
         else if (viewId === 'history') loadHistoryRecords();
         else if (viewId === 'companies') loadCompanies();
@@ -1268,8 +1340,8 @@
         else if (viewId === 'workflow') loadWorkflows();
         else if (viewId === 'new-analysis') loadNewAnalysisPanel();
     }
-    window.addEventListener('popstate', e => switchView((e.state && e.state.view) || 'control'));
-    try { history.replaceState({ view: 'control' }, '', '#control'); } catch (e) {}
+    window.addEventListener('popstate', e => switchView((e.state && e.state.view) || 'start'));
+    try { history.replaceState({ view: 'start' }, '', '#start'); } catch (e) {}
 
     // ── Agent status poller (navbar + sidebar) ──────────────────────────────
     function startStatePoll() {
@@ -3921,6 +3993,184 @@
             const r = await apiGet('/api/alerts/test');
             alert('Test alerts sent! Check webhook/email configuration.');
         } catch (e) { alert('Error: ' + e.message); }
+    }
+
+    // ── Start view (Region → Discovery → Company → Workflow → Result) ──────
+    let startSpecs = {};
+    let startActiveWf = 'brand_visibility_standard';
+
+    async function loadStart() {
+        try {
+            const rg = await apiGet('/api/regions');
+            const rsel = document.getElementById('start-region');
+            const curR = rsel.value;
+            rsel.innerHTML = '<option value="">Select Region...</option>' +
+                (rg.regions || []).map(r => `<option value="${esc(r)}">${esc(r)}</option>`).join('');
+            if (curR) rsel.value = curR;
+        } catch (e) {}
+        try {
+            const comps = await apiGet('/companies');
+            const csel = document.getElementById('start-company');
+            const curC = csel.value;
+            csel.innerHTML = '<option value="">Select company...</option>' +
+                (comps || []).map(c => `<option value="${c.id}">${esc(c.brand_name)}</option>`).join('');
+            if (curC) csel.value = curC;
+        } catch (e) {}
+        try {
+            const a = await apiGet('/api/workflow/active');
+            startSpecs = a.spec_workflows || {};
+            startActiveWf = a.workflow_id || 'brand_visibility_standard';
+            const wsel = document.getElementById('start-workflow');
+            wsel.innerHTML = Object.keys(startSpecs).map(k =>
+                `<option value="${k}"${k === startActiveWf ? ' selected' : ''}>${esc(startSpecs[k].name)}</option>`).join('');
+            renderStartDiagram();
+        } catch (e) {}
+        await startRefreshLive();
+        if (window.startPollTimer) clearInterval(window.startPollTimer);
+        window.startPollTimer = setInterval(() => {
+            const p = document.getElementById('start-view');
+            if (p && p.classList.contains('active')) startRefreshLive();
+        }, 8000);
+        try { await startRefreshSummary(); } catch (e) {}
+    }
+
+    function renderStartDiagram() {
+        const wsel = document.getElementById('start-workflow');
+        const wid = (wsel && wsel.value) || startActiveWf;
+        const spec = startSpecs[wid];
+        const el = document.getElementById('start-diagram');
+        if (!spec) { el.innerHTML = '<div class="form-hint">Select a workflow.</div>'; return; }
+        el.innerHTML = '<strong>' + esc(spec.name) + '</strong><div style="margin-top:8px;">' +
+            spec.visible.map((s, i) =>
+                (i > 0 ? '<span style="color:var(--accent-blue);font-weight:800;"> → </span>' : '') +
+                `<span class="tag-pill${i === 0 ? ' industry' : ''}">${esc(s)}</span>`).join('') + '</div>';
+    }
+
+    async function startWorkflowChanged() {
+        const wsel = document.getElementById('start-workflow');
+        const wid = wsel.value;
+        if (!wid || !startSpecs[wid]) return;
+        try {
+            await apiPost('/api/workflow/active', { workflow_id: wid });
+            startActiveWf = wid;
+            showToast('Workflow switched: ' + startSpecs[wid].name, 'success');
+        } catch (e) { showToast('Switch failed: ' + e.message, 'error'); }
+        renderStartDiagram();
+    }
+
+    async function startDiscover() {
+        const region = document.getElementById('start-region').value;
+        const industry = document.getElementById('start-industry').value.trim();
+        const box = document.getElementById('start-disc-counts');
+        const list = document.getElementById('start-candidates');
+        if (!industry) { showToast('Enter an industry to discover companies.', 'error'); return; }
+        box.innerHTML = '<div class="form-hint">Discovering real companies…</div>';
+        list.innerHTML = '';
+        try {
+            const r = await apiPost('/agent/run-discover', { industry, region });
+            if (!r.success) { box.innerHTML = `<div class="banner rose"><div>${esc(r.status || r.error || 'Discovery failed')}</div></div>`; return; }
+            const v = r.verified || 0, n = r.needs_verification || 0, inv = r.invalid || 0;
+            box.innerHTML = `<div class="metrics-cards-grid grid-2">
+                <div class="metric-mini-card"><div class="metric-header">Discovered</div><div class="metric-value">${r.candidates || 0}</div></div>
+                <div class="metric-mini-card"><div class="metric-header">Verified</div><div class="metric-value">${v}</div></div>
+                <div class="metric-mini-card"><div class="metric-header">Needs verification</div><div class="metric-value">${n}</div></div>
+                <div class="metric-mini-card"><div class="metric-header">Invalid</div><div class="metric-value">${inv}</div></div>
+            </div><div class="form-hint">Counts are discovered candidates only — not full market coverage.</div>`;
+            const c = await apiGet('/api/discovery/candidates?status=NEW');
+            const rows = (c.candidates || []).slice(0, 12);
+            list.innerHTML = rows.map(x =>
+                `<div class="query-item"><span style="flex:1;"><strong>${esc(x.candidate_name)}</strong> <span class="form-hint">${esc(x.website || '')} · ${esc(x.verification_status || '')}</span></span><button class="btn-secondary btn-sm" onclick="importCandidate(${x.id})">Import</button></div>`).join('') ||
+                '<div class="form-hint">No new candidates to review.</div>';
+            loadStart();
+        } catch (e) { box.innerHTML = `<div class="banner rose"><div>${esc(e.message)}</div></div>`; }
+    }
+
+    async function startRefreshSummary() {
+        try {
+            const s = await apiGet('/api/discovery/summary');
+            const box = document.getElementById('start-disc-counts');
+            if (box && !box.innerHTML) {
+                box.innerHTML = `<div class="form-hint">Discovered: <strong>${s.discovered}</strong> · Verified: <strong>${s.verified}</strong> · Needs verification: <strong>${s.needs_verification}</strong> · Invalid: <strong>${s.invalid}</strong></div>`;
+            }
+        } catch (e) {}
+    }
+
+    async function startRunCompany() {
+        const cid = document.getElementById('start-company').value;
+        const wid = document.getElementById('start-workflow').value || startActiveWf;
+        if (!cid) { showToast('Select a company first.', 'error'); return; }
+        const btn = document.getElementById('start-run-btn');
+        btn.disabled = true; btn.innerText = 'Running…';
+        try {
+            const r = await apiPost('/agent/run-company', { company_id: parseInt(cid, 10), workflow_id: wid });
+            showToast('Analysis started (' + (r.run_id || '') + ') with ' + ((startSpecs[wid] || {}).name || wid) + '.', 'success');
+            setTimeout(startRefreshLive, 5000);
+        } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+        finally { btn.disabled = false; btn.innerText = '▶ Run Analysis'; }
+    }
+
+    async function startToggleMonitoring() {
+        try {
+            const st = await apiGet('/api/scheduler/status');
+            const r = await apiPost(st.paused ? '/api/scheduler/resume' : '/api/scheduler/pause', {});
+            showToast(r.paused === false || st.paused ? 'Automatic monitoring ON.' : 'Automatic monitoring OFF.', 'success');
+        } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+        startRefreshLive();
+    }
+
+    async function startRefreshLive() {
+        try {
+            const st = await apiGet('/api/scheduler/status');
+            const mb = document.getElementById('start-mon-btn');
+            if (mb) mb.innerText = 'Automatic Monitoring: ' + (st.paused ? 'OFF' : 'ON');
+        } catch (e) {}
+        try {
+            const s = await apiGet('/agent-state');
+            const run = s.run || {};
+            const lv = document.getElementById('start-live');
+            const step = run.current_task || run.status || (s.loop_running ? 'IDLE' : 'STOPPED');
+            lv.innerHTML = `<div class="queries-grid">
+                <div class="query-item"><span class="form-hint">Agent</span><strong>${s.loop_running ? 'RUNNING' : 'IDLE'}</strong></div>
+                <div class="query-item"><span class="form-hint">Current step</span><strong>${esc(step || '—')}</strong></div>
+                <div class="query-item"><span class="form-hint">Current workflow</span><strong>${esc((startSpecs[startActiveWf] || {}).name || startActiveWf)}</strong></div>
+                <div class="query-item"><span class="form-hint">Last run</span><strong>${esc((s.last_run && (s.last_run.run_id || s.last_run.status)) || '—')}</strong></div>
+                <div class="query-item"><span class="form-hint">Next scheduled check</span><strong>${esc(s.next_run_at || s.automation.next_scheduled || '—')}</strong></div>
+            </div>`;
+        } catch (e) {}
+        const cid = (document.getElementById('start-company') || {}).value;
+        if (cid) {
+            try {
+                const comps = await apiGet('/companies');
+                const c = (comps || []).find(x => String(x.id) === String(cid));
+                if (c) {
+                    document.getElementById('start-result').innerHTML =
+                        `<div class="queries-grid">
+                            <div class="query-item"><span class="form-hint">Company</span><strong>${esc(c.brand_name)}</strong></div>
+                            <div class="query-item"><span class="form-hint">Score</span><strong>${c.last_score != null ? c.last_score : '—'}</strong></div>
+                            <div class="query-item"><span class="form-hint">Analyzed</span><strong>${esc((c.last_analyzed_at || '').slice(0, 19).replace('T', ' ') || 'never')}</strong></div>
+                            <div class="query-item"><span class="form-hint">Data</span><strong>${esc(c.verification_status || 'UNVERIFIED')}</strong></div>
+                        </div>`;
+                }
+            } catch (e) {}
+            try {
+                const w = await apiGet('/api/workflow/runs?company_id=' + encodeURIComponent(cid) + '&limit=3');
+                const rows = w.runs || [];
+                document.getElementById('start-exec').innerHTML = rows.length ? rows.map(r => {
+                    const steps = (r.steps || []).map(s =>
+                        `<div class="loading-step-item ${s.ok ? 'completed' : ''}"><div class="step-icon">${s.ok ? '✓' : '✗'}</div>${esc(s.step)} <span class="form-hint">${s.duration_s != null ? s.duration_s + 's' : ''} ${esc(s.error || '')}</span></div>`).join('');
+                    return `<div style="margin-bottom:10px;"><div class="form-hint"><strong>${esc(r.workflow_id)}</strong> · ${esc(r.status)} · ${r.duration_s != null ? r.duration_s + 's' : ''} · ${esc((r.started_at || '').slice(0, 19).replace('T', ' '))}${r.mode === 'changed' ? ' · partial (' + esc((r.skipped || {}).reason || 'skipped steps') + ')' : ''}</div><div class="loading-steps-list" style="margin-top:6px;">${steps}</div></div>`;
+                }).join('') : '<div class="form-hint">No runs yet for this company.</div>';
+            } catch (e) {}
+        }
+        try {
+            const h = await apiGet('/api/health/full');
+            const order = ['backend', 'database', 'scheduler', 'worker', 'workflows', 'search', 'rag', 'llm', 'learning'];
+            document.getElementById('start-health').innerHTML = order.map(k => {
+                const v = (h.checks || {})[k];
+                const ok = v === true;
+                return `<span class="tag-pill ${ok ? 'green' : 'rose'}" title="${esc(String(v))}">${esc(k)} ${ok ? '✓' : '✗'}</span>`;
+            }).join('');
+        } catch (e) {}
     }
 
     // ── Workflow Self-Learning UI ──────────────────────────────────────────

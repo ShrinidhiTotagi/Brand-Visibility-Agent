@@ -284,8 +284,6 @@ def _cors_headers(handler, origin=None):
 # OPTIONAL INTEGRATIONS (disable gracefully when not connected)
 # ---------------------------------------------------------------------------
 # Credentials come from environment / .env (never committed to git).
-# For a 2-file server copy, hardcode them here locally (DO NOT git-push
-# hardcoded keys - GitHub secret scanning rejects the push).
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 
@@ -353,7 +351,7 @@ except ImportError:
     print("[requests] NOT CONNECTED - 'requests' package missing.", flush=True)
 
 # ── Groq (free tier: 14,400 req/day) ──────────────────────────────────────
-# Key from environment / .env (never committed - see note above).
+# Key from environment / .env (never committed).
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = "qwen/qwen3.8-27b"
 groq_client = None
@@ -885,6 +883,25 @@ TABLES = {
         ("completed_at", "TEXT"),
         ("next_run_at", "TEXT"),
         ("automation_id", "INTEGER"),
+    ],
+    "workflow_runs": [
+        ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+        ("run_id", "TEXT"),
+        ("company_id", "INTEGER"),
+        ("workflow_id", "TEXT"),
+        ("workflow_version", "INTEGER DEFAULT 1"),
+        ("steps_json", "TEXT"),
+        ("tools_json", "TEXT"),
+        ("rag_json", "TEXT"),
+        ("reasoning_json", "TEXT"),
+        ("status", "TEXT DEFAULT 'RUNNING'"),
+        ("error", "TEXT"),
+        ("started_at", "TEXT"),
+        ("finished_at", "TEXT"),
+        ("duration_s", "REAL DEFAULT 0"),
+        ("mode", "TEXT DEFAULT 'full'"),
+        ("skipped_json", "TEXT"),
+        ("plan_json", "TEXT"),
     ],
     "agent_activity": [
         ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
@@ -1461,6 +1478,11 @@ def init_db():
         ensure_registry_seed()
     except Exception as e:
         print(f"[Schema] registry seed skipped ({e})", flush=True)
+    # Spec workflows (fixed IDs) seed - idempotent.
+    try:
+        ensure_spec_workflows()
+    except Exception as e:
+        print(f"[Schema] spec workflows skipped ({e})", flush=True)
     # MCP tool registry seed (idempotent; preserves operator edits).
     try:
         ensure_mcp_tools()
@@ -12035,6 +12057,42 @@ def dispatch_job(job, ctx, run_id):
         _update_learning_from_run(cid, ctx, run_id)
         return {"ok": True}
 
+    if jt == "RAG_INDEX":
+        try:
+            res = rag_index_company(cid, None, None) or {}
+            n = res.get("indexed", 0) or 0
+            ctx["rag_indexed"] = n
+            return {"ok": True, "indexed": n}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200], "indexed": 0}
+
+    if jt == "RAG_RETRIEVE":
+        brand_name = (brand or {}).get("brand_name", "") or ""
+        industry = (brand or {}).get("industry", "") or ""
+        try:
+            res = rag_search(cid, f"{brand_name} {industry} visibility evidence".strip() or brand_name,
+                             5, None, None) or {}
+            items = res.get("results") or []
+            ctx["rag_context"] = {"status": res.get("status"), "count": len(items),
+                                  "items": items[:5]}
+            if not items:
+                return {"ok": True, "rag": "NO_RELEVANT_RAG_CONTEXT", "count": 0}
+            return {"ok": True, "rag": "RETRIEVED", "count": len(items)}
+        except Exception as e:
+            ctx["rag_context"] = {"status": "RAG_FAILED", "detail": str(e)[:200]}
+            return {"ok": True, "rag": "RAG_FAILED", "count": 0}
+
+    if jt == "REASONING":
+        try:
+            res = reason_about_company(cid, store=True, run_id=run_id, use_rag=True) or {}
+            ctx["reasoning"] = {"decision": res.get("recommended_action"),
+                                "reason": res.get("reason"),
+                                "confidence": res.get("confidence"),
+                                "reasoning_id": res.get("reasoning_id")}
+            return {"ok": True, "reasoning": res.get("recommended_action")}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+
     if jt == "REANALYZE_COMPANY":
         # Coordinator job: it plans (dedup-aware) the full pipeline for the company.
         planned = plan_company_jobs(cid, run_id)
@@ -12377,64 +12435,267 @@ def promote_global_patterns(min_companies=None):
     return {"promoted": promoted}
 
 
-def run_full_pipeline(company_id, trigger="MANUAL", run_id=None, direct=True):
+def run_full_pipeline(company_id, trigger="MANUAL", run_id=None, direct=True, workflow_id=None):
     """Entry point: full autonomous-style analysis for a single company.
     direct=True executes the pipeline inline with zero job rows (fast path
     for manual runs). direct=False uses the persistent job queue (background)."""
     if not run_id:
         run_id = create_run(trigger, companies=[company_id])
     if direct:
-        summary = run_company_direct(company_id, run_id)
+        summary = run_company_direct(company_id, run_id, workflow_id=workflow_id)
     else:
         summary = process_company_jobs(company_id, run_id)
     finalize_run(run_id, "FAILED" if summary.get("errors") else "COMPLETED")
     return run_id
 
 
-DIRECT_PIPELINE = ["COLLECT_WEBSITE_DATA", "VALIDATE_DATA", "GENERATE_QUERIES", "RUN_AI_SEARCH",
-                   "ANALYZE_BRAND", "ANALYZE_COMPETITORS", "DETECT_CONTENT_GAPS",
-                   "GENERATE_RECOMMENDATIONS", "DETECT_CHANGES", "STORE_ANALYSIS", "UPDATE_LEARNING"]
+# ---------------------------------------------------------------------------
+# SPEC WORKFLOWS (§2-§4): exactly two primary workflows with fixed IDs.
+# The selected workflow controls the REAL execution path (ops list),
+# not just the label. Visible steps are the UI diagram; ops are what run.
+# ---------------------------------------------------------------------------
+SPEC_WORKFLOWS = {
+    "brand_visibility_standard": {
+        "name": "Workflow 1 — Standard Analysis",
+        "visible": ["Company Data", "Website", "AI Search", "Brand Analysis",
+                    "Competitors", "Recommendations"],
+        "ops": ["VALIDATE_DATA", "COLLECT_WEBSITE_DATA", "GENERATE_QUERIES", "RUN_AI_SEARCH",
+                "ANALYZE_BRAND", "ANALYZE_COMPETITORS", "DETECT_CONTENT_GAPS",
+                "GENERATE_RECOMMENDATIONS", "DETECT_CHANGES", "STORE_ANALYSIS", "UPDATE_LEARNING"],
+        "visible_map": {
+            "Company Data": ["VALIDATE_DATA"],
+            "Website": ["COLLECT_WEBSITE_DATA"],
+            "AI Search": ["GENERATE_QUERIES", "RUN_AI_SEARCH"],
+            "Brand Analysis": ["ANALYZE_BRAND"],
+            "Competitors": ["ANALYZE_COMPETITORS"],
+            "Recommendations": ["DETECT_CONTENT_GAPS", "GENERATE_RECOMMENDATIONS",
+                                "DETECT_CHANGES", "STORE_ANALYSIS", "UPDATE_LEARNING"],
+        },
+    },
+    "rag_enhanced_analysis": {
+        "name": "Workflow 2 — RAG-Enhanced Analysis",
+        "visible": ["Company Data", "Website", "RAG", "AI Search", "Competitors",
+                    "Reasoning", "Recommendations"],
+        "ops": ["VALIDATE_DATA", "COLLECT_WEBSITE_DATA", "RAG_INDEX", "RAG_RETRIEVE",
+                "GENERATE_QUERIES", "RUN_AI_SEARCH", "ANALYZE_COMPETITORS", "REASONING",
+                "GENERATE_RECOMMENDATIONS", "DETECT_CHANGES", "STORE_ANALYSIS", "UPDATE_LEARNING"],
+        "visible_map": {
+            "Company Data": ["VALIDATE_DATA"],
+            "Website": ["COLLECT_WEBSITE_DATA"],
+            "RAG": ["RAG_INDEX", "RAG_RETRIEVE"],
+            "AI Search": ["GENERATE_QUERIES", "RUN_AI_SEARCH"],
+            "Competitors": ["ANALYZE_COMPETITORS"],
+            "Reasoning": ["REASONING"],
+            "Recommendations": ["GENERATE_RECOMMENDATIONS", "DETECT_CHANGES",
+                                "STORE_ANALYSIS", "UPDATE_LEARNING"],
+        },
+    },
+}
+
+DIRECT_PIPELINE = SPEC_WORKFLOWS["brand_visibility_standard"]["ops"]
 
 
-def run_company_direct(company_id, run_id):
-    """Execute the full pipeline inline with zero job-table rows.
-
-    Same step functions the queue workers call (dispatch_job), but no
-    enqueue/dedup/pick/wait hops. Used for manual runs where the user
-    wants results now, not queue position."""
-    ctx = CTX.setdefault((run_id, company_id), {})
-    summary = {"queries": 0, "observations": 0, "new_evidence": 0, "changes": 0,
-               "recommendations": 0, "errors": 0, "steps": []}
+def get_active_workflow():
+    """Selected primary workflow id (spec default: standard)."""
     try:
-        log_activity(f"Direct analysis started for company #{company_id}", level="RUN",
+        wf = get_config("active_workflow_id", "brand_visibility_standard")
+    except Exception:
+        wf = "brand_visibility_standard"
+    return wf if wf in SPEC_WORKFLOWS else "brand_visibility_standard"
+
+
+def set_active_workflow(workflow_id):
+    if workflow_id not in SPEC_WORKFLOWS:
+        return {"success": False, "error": "Unknown workflow. Use brand_visibility_standard or rag_enhanced_analysis."}
+    save_config({"active_workflow_id": workflow_id})
+    spec = SPEC_WORKFLOWS[workflow_id]
+    return {"success": True, "workflow_id": workflow_id, "name": spec["name"],
+            "visible": spec["visible"]}
+
+
+def ensure_spec_workflows():
+    """Seed the two fixed-ID workflow definitions (idempotent)."""
+    try:
+        db.execute("ALTER TABLE workflow_runs ADD COLUMN mode TEXT DEFAULT 'full'")
+    except Exception:
+        pass
+    try:
+        db.execute("ALTER TABLE workflow_runs ADD COLUMN skipped_json TEXT")
+    except Exception:
+        pass
+    try:
+        db.execute("ALTER TABLE workflow_runs ADD COLUMN plan_json TEXT")
+    except Exception:
+        pass
+    for wid, spec in SPEC_WORKFLOWS.items():
+        try:
+            rows = db.query("SELECT workflow_id FROM workflow_definitions WHERE workflow_id=?", (wid,))
+            if rows:
+                continue
+            steps = [{"id": op.lower(), "operation": op, "agent": "pipeline", "tool": None}
+                     for op in spec["ops"]]
+            deps = {}
+            ops = spec["ops"]
+            for i in range(1, len(ops)):
+                deps[ops[i].lower()] = [ops[i - 1].lower()]
+            wf = workflow_create(name=spec["name"],
+                                 description="Primary spec workflow (" + wid + "). Visible: " +
+                                             " → ".join(spec["visible"]),
+                                 steps=steps, dependencies=deps,
+                                 metadata={"spec_workflow_id": wid, "visible": spec["visible"],
+                                           "visible_map": spec["visible_map"]},
+                                 created_by="SPEC")
+            # Override the random id with the fixed spec id.
+            new_id = wf["workflow_id"]
+            db.execute("UPDATE workflow_definitions SET workflow_id=? WHERE workflow_id=?", (wid, new_id))
+            db.execute("UPDATE workflow_versions SET workflow_id=? WHERE workflow_id=?", (wid, new_id))
+            try:
+                db.execute("UPDATE workflow_changes SET workflow_id=? WHERE workflow_id=?", (wid, new_id))
+            except Exception:
+                pass
+            try:
+                db.execute("UPDATE workflow_adaptation_events SET workflow_id=? WHERE workflow_id=?", (wid, new_id))
+            except Exception:
+                pass
+            workflow_activate_version(wid, 1)
+        except Exception as e:
+            print(f"[SpecWorkflows] ensure {wid} skipped: {e}", flush=True)
+    return {"success": True}
+
+
+def impact_ops(company_id, ops):
+    """§19 partial re-execution: if the only recent changes are website /
+    content / profile changes AND queries already exist, skip query
+    regeneration + AI search and reuse them. Returns (ops_to_run, skipped, reason).
+    Anything else → full ops with an honest reason."""
+    try:
+        rows = db.query("SELECT change_type FROM change_log WHERE brand_id=? ORDER BY id DESC LIMIT 20",
+                        (company_id,))
+        types = {(r.get("change_type") or "") for r in rows} - {""}
+    except Exception:
+        return ops, [], "change history unreadable - full run"
+    if not types:
+        return ops, [], "no recorded changes - full run"
+    web_only = types <= {"CONTENT_ADDED", "CONTENT_REMOVED", "PROFILE_CHANGED"}
+    if not web_only:
+        return ops, [], f"non-website changes present ({', '.join(sorted(types))}) - full run"
+    try:
+        qrows = db.query("SELECT COUNT(*) AS c FROM query_memory WHERE brand_id=? AND is_active=1", (company_id,))
+        if not qrows or not qrows[0]["c"]:
+            return ops, [], "no reusable queries - full run"
+    except Exception:
+        return ops, [], "query store unreadable - full run"
+    skip = [o for o in ops if o in ("GENERATE_QUERIES", "RUN_AI_SEARCH")]
+    if not skip:
+        return ops, [], "pipeline has no query steps - full run"
+    return [o for o in ops if o not in ("GENERATE_QUERIES", "RUN_AI_SEARCH")], skip, \
+        "website/content-only changes with fresh queries - reusing queries + observations"
+
+
+def run_company_direct(company_id, run_id, workflow_id=None, mode="auto"):
+    """Execute the SELECTED workflow's real ops inline (zero job rows).
+
+    Workflow 1 and Workflow 2 take genuinely different paths (RAG +
+    Reasoning only run under rag_enhanced_analysis). Every step is timed
+    and the full record lands in workflow_runs for the ledger/UI/ATs."""
+    wid = workflow_id if workflow_id in SPEC_WORKFLOWS else get_active_workflow()
+    spec = SPEC_WORKFLOWS[wid]
+    ops = spec["ops"]
+    skipped_ops, skip_reason = [], "full run"
+    if mode != "full":
+        # "auto" (default): use partial re-execution only when the impact
+        # analysis proves website/content-only changes with reusable queries.
+        ops, skipped_ops, skip_reason = impact_ops(company_id, ops)
+        mode = "changed" if skipped_ops else "full"
+    t_start = time.time()
+    started = now()
+    ctx = CTX.setdefault((run_id, company_id), {})
+    summary = {"workflow_id": wid, "workflow_name": spec["name"], "mode": mode,
+               "skipped_ops": skipped_ops, "skip_reason": skip_reason,
+               "queries": 0, "observations": 0, "new_evidence": 0, "changes": 0,
+               "recommendations": 0, "errors": 0, "steps": []}
+    ledger_id = None
+    plan_snapshot = {"workflow_id": wid, "name": spec["name"], "visible": spec["visible"],
+                     "ops": ops, "visible_map": spec["visible_map"], "mode": mode,
+                     "skipped_ops": skipped_ops, "skip_reason": skip_reason}
+    try:
+        ledger_id = db.execute(
+            "INSERT INTO workflow_runs (run_id, company_id, workflow_id, workflow_version, "
+            "steps_json, status, started_at, mode, skipped_json, plan_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (run_id, company_id, wid, 1, json.dumps([]), "RUNNING", started, mode,
+             json.dumps({"skipped": skipped_ops, "reason": skip_reason})[:2000],
+             json.dumps(plan_snapshot)[:4000]))
+    except Exception:
+        ledger_id = None
+    try:
+        log_activity(f"Direct {spec['name']} started for company #{company_id}", level="RUN",
                      run_id=run_id, company_id=company_id)
     except Exception:
         pass
-    for jt in DIRECT_PIPELINE:
+    tools_used = set()
+    for jt in ops:
+        step_t0 = time.time()
         try:
             db.execute("UPDATE runs SET current_task=? WHERE run_id=?", (jt, run_id))
         except Exception:
             pass
         try:
             res = dispatch_job({"job_type": jt, "company_id": company_id, "id": 0}, ctx, run_id) or {}
-            summary["steps"].append({"step": jt, "ok": True})
+            dur = round(time.time() - step_t0, 2)
+            summary["steps"].append({"step": jt, "ok": True, "duration_s": dur})
+            tools_used.add(jt)
             for k in ("queries", "observations", "new_evidence", "changes", "recommendations"):
                 try:
                     summary[k] += res.get(k, 0) or 0
                 except Exception:
                     pass
         except Exception as e:
+            dur = round(time.time() - step_t0, 2)
             summary["errors"] += 1
-            summary["steps"].append({"step": jt, "ok": False, "error": str(e)[:200]})
+            summary["steps"].append({"step": jt, "ok": False, "error": str(e)[:200], "duration_s": dur})
             try:
                 log_activity(f"Direct step {jt} failed for company #{company_id}: {str(e)[:160]}",
                              level="WARN", run_id=run_id, company_id=company_id)
             except Exception:
                 pass
+    duration = round(time.time() - t_start, 2)
+    summary["duration_s"] = duration
+    if ledger_id:
+        try:
+            # Compact RAG items first (truncate fields, not the JSON string -
+            # slicing dumped JSON mid-string produces unparseable fragments).
+            _rc = ctx.get("rag_context") or {}
+            if isinstance(_rc, dict):
+                _items = []
+                for _it in (_rc.get("items") or [])[:3]:
+                    if not isinstance(_it, dict):
+                        continue
+                    _items.append({
+                        "document_id": _it.get("document_id"),
+                        "company_id": _it.get("company_id"),
+                        "source_type": _it.get("source_type"),
+                        "source_record_id": _it.get("source_record_id"),
+                        "content": str(_it.get("content") or _it.get("text") or "")[:300],
+                        "score": _it.get("score")})
+                _rc = {"status": _rc.get("status"), "count": _rc.get("count"), "items": _items}
+            elif not isinstance(_rc, (int, float)):
+                _rc = {"indexed": _rc} if _rc else {}
+            db.execute("UPDATE workflow_runs SET steps_json=?, tools_json=?, rag_json=?, reasoning_json=?, "
+                       "status=?, finished_at=?, duration_s=?, mode=?, skipped_json=? WHERE id=?",
+                       (json.dumps(summary["steps"])[:8000],
+                        json.dumps(sorted(tools_used))[:2000],
+                        json.dumps(_rc)[:2000],
+                        json.dumps(ctx.get("reasoning") or {})[:2000],
+                        "FAILED" if summary["errors"] else "COMPLETED", now(), duration,
+                        summary.get("mode", "full"),
+                        json.dumps({"skipped": summary.get("skipped_ops", []),
+                                    "reason": summary.get("skip_reason", "")})[:2000], ledger_id))
+        except Exception:
+            pass
     try:
-        log_activity(f"Direct analysis finished for company #{company_id}: "
+        log_activity(f"Direct {spec['name']} finished for company #{company_id}: "
                      f"{summary['queries']} queries, {summary['observations']} obs, "
-                     f"{summary['changes']} changes, {summary['errors']} errors",
+                     f"{summary['changes']} changes, {summary['errors']} errors in {duration}s",
                      level="RUN", run_id=run_id, company_id=company_id)
     except Exception:
         pass
@@ -12717,12 +12978,13 @@ def run_now(payload, background=True):
     steps = len(DIRECT_PIPELINE) * len(plan)
     log_activity(f"Run {rid} started (direct): {len(plan)} company(ies), {steps} step(s).", level="RUN",
                  run_id=rid)
+    wf_sel = (payload.get("workflow_id") or "").strip() or None
 
     def _go():
         try:
             for p in plan:
                 try:
-                    run_company_direct(p["company_id"], rid)
+                    run_company_direct(p["company_id"], rid, workflow_id=wf_sel)
                 except Exception as e:
                     print(f"[DirectRun] company {p['company_id']} failed: {e}", flush=True)
         finally:
@@ -12741,22 +13003,24 @@ def run_now(payload, background=True):
             "mode": "direct", "stats": _run_stats(rid)}
 
 
-def run_all_companies():
+def run_all_companies(workflow_id=None):
     """Force-run ALL active companies via DIRECT inline execution (no queue).
     Split across 3 worker threads; returns immediately with the run id."""
     ids = [r["id"] for r in db.query("SELECT id FROM brands WHERE is_active=1")]
     if not ids:
         return {"success": True, "run_id": None, "companies": 0, "jobs_created": 0,
                 "message": "No companies found."}
+    wid = workflow_id if workflow_id in SPEC_WORKFLOWS else get_active_workflow()
+    ops_len = len(SPEC_WORKFLOWS[wid]["ops"])
     rid = create_run("RUN_ALL", companies=ids)
-    steps = len(DIRECT_PIPELINE) * len(ids)
-    log_activity(f"RUN_ALL (direct): {len(ids)} companies, {steps} steps across 3 workers",
+    steps = ops_len * len(ids)
+    log_activity(f"RUN_ALL (direct, {wid}): {len(ids)} companies, {steps} steps across 3 workers",
                  level="RUN", run_id=rid)
 
     def _worker(sub):
         for cid in sub:
             try:
-                run_company_direct(cid, rid)
+                run_company_direct(cid, rid, workflow_id=wid, mode="full")
             except Exception as e:
                 print(f"[RunAll] company {cid} failed: {e}", flush=True)
 
@@ -13859,6 +14123,147 @@ scheduler = AutomationScheduler()
 # COMPANY DISCOVERY  (external integrations only - never fabricated)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# REGION-BASED DISCOVERY + CANDIDATE VALIDATION (§6-§10)
+# ---------------------------------------------------------------------------
+REGIONS = ["Karnataka", "Maharashtra", "Tamil Nadu", "Telangana", "Delhi",
+           "India", "United States", "United Kingdom"]
+
+VERIFICATION_STATUSES = ["VERIFIED", "PARTIALLY_VERIFIED", "INSUFFICIENT_DATA",
+                         "INVALID", "FAILED"]
+
+
+def ensure_candidate_columns():
+    """Add validation/provenance columns to discovery_candidates (idempotent)."""
+    for coldef in ("verification_status TEXT DEFAULT 'INSUFFICIENT_DATA'",
+                   "verified_at TEXT", "last_checked_at TEXT",
+                   "source_url TEXT", "validation_json TEXT"):
+        try:
+            db.execute(f"ALTER TABLE discovery_candidates ADD COLUMN {coldef}")
+        except Exception:
+            pass
+
+
+def _check_url_reachable(url, timeout=6):
+    """HEAD (GET fallback) reachability probe. Returns (ok, http_status_or_error)."""
+    try:
+        from urllib.request import Request, urlopen
+        req = Request(url, method="HEAD", headers={"User-Agent": "VisibilityAI/2.0 (validation probe)"})
+        try:
+            resp = urlopen(req, timeout=timeout)
+            code = getattr(resp, "status", 200)
+            resp.close()
+            return True, code
+        except Exception as e:
+            if "405" in str(e) or "501" in str(e):
+                req2 = Request(url, headers={"User-Agent": "VisibilityAI/2.0 (validation probe)"})
+                resp2 = urlopen(req2, timeout=timeout)
+                code2 = getattr(resp2, "status", 200)
+                try:
+                    resp2.read(1)
+                except Exception:
+                    pass
+                resp2.close()
+                return True, code2
+            return False, str(e)[:120]
+    except Exception as e:
+        return False, str(e)[:120]
+
+
+def validate_candidate(cid):
+    """Validate one candidate; assigns VERIFIED/PARTIALLY_VERIFIED/
+    INSUFFICIENT_DATA/INVALID/FAILED with reasons. Never fabricates data."""
+    ensure_candidate_columns()
+    rows = db.query("SELECT * FROM discovery_candidates WHERE id=?", (cid,))
+    if not rows:
+        return {"success": False, "error": "Candidate not found"}
+    c = dict(rows[0])
+    name = (c.get("candidate_name") or "").strip()
+    website = (c.get("website") or "").strip()
+    industry = (c.get("industry") or "").strip()
+    region = (c.get("region") or "").strip()
+    checks = {}
+    t = now()
+    if not name:
+        status, reason = "INSUFFICIENT_DATA", "missing company name"
+    else:
+        dup = db.query("SELECT id FROM brands WHERE brand_name=? AND is_active=1 LIMIT 1", (name,))
+        checks["duplicate_of_brand"] = bool(dup)
+        if dup:
+            status, reason = "INVALID", "duplicate of tracked company"
+        elif not website:
+            status, reason = "INSUFFICIENT_DATA", "missing website"
+        else:
+            import re as _re
+            url = website if _re.match(r"^https?://", website, _re.IGNORECASE) else "https://" + website
+            checks["url_normalized"] = (url != website)
+            if not _re.match(r"^https?://[^\s/$.?#].[^\s]*$", url, _re.IGNORECASE):
+                status, reason = "INVALID", "malformed website URL"
+            else:
+                try:
+                    ok, info = _check_url_reachable(url)
+                except Exception as e:
+                    ok, info = False, f"probe error: {e}"[:120]
+                checks["reachable"] = ok
+                checks["http"] = info
+                if ok:
+                    if url != website:
+                        try:
+                            db.execute("UPDATE discovery_candidates SET website=? WHERE id=?", (url, cid))
+                            website = url
+                        except Exception:
+                            pass
+                    if industry:
+                        status, reason = "VERIFIED", f"website reachable (HTTP {info})"
+                    else:
+                        status, reason = "PARTIALLY_VERIFIED", f"website reachable (HTTP {info}); industry missing"
+                else:
+                    status, reason = "PARTIALLY_VERIFIED", f"website not reachable ({info})"
+    try:
+        verified_at = t if status == "VERIFIED" else c.get("verified_at")
+        db.execute("UPDATE discovery_candidates SET verification_status=?, verified_at=?, last_checked_at=?, "
+                   "source_url=?, validation_json=? WHERE id=?",
+                   (status, verified_at, t, website or None,
+                    json.dumps({"reason": reason, "checks": checks})[:2000], cid))
+    except Exception as e:
+        return {"success": False, "error": str(e)[:200]}
+    return {"success": True, "id": cid, "verification_status": status, "reason": reason, "checks": checks}
+
+
+def discovery_summary():
+    """Honest counts: discovered / verified / needs-verification / invalid / rejected.
+    Never claims complete coverage."""
+    ensure_candidate_columns()
+    try:
+        total = db.query("SELECT COUNT(*) AS c FROM discovery_candidates")[0]["c"]
+    except Exception:
+        total = 0
+    by_status = {}
+    try:
+        for r in db.query("SELECT verification_status, COUNT(*) AS c FROM discovery_candidates "
+                          "GROUP BY verification_status"):
+            by_status[r["verification_status"] or "INSUFFICIENT_DATA"] = r["c"]
+    except Exception:
+        pass
+    tracked = 0
+    try:
+        tracked = db.query("SELECT COUNT(*) AS c FROM discovery_candidates WHERE status='IMPORTED'")[0]["c"]
+    except Exception:
+        pass
+    rejected = 0
+    try:
+        rejected = db.query("SELECT COUNT(*) AS c FROM discovery_candidates WHERE status='REJECTED'")[0]["c"]
+    except Exception:
+        pass
+    verified = by_status.get("VERIFIED", 0)
+    needs = by_status.get("PARTIALLY_VERIFIED", 0) + by_status.get("INSUFFICIENT_DATA", 0)
+    invalid = by_status.get("INVALID", 0) + by_status.get("FAILED", 0)
+    return {"success": True, "discovered": total, "verified": verified,
+            "needs_verification": needs, "invalid": invalid, "rejected": rejected,
+            "tracked": tracked, "by_status": by_status,
+            "note": "Counts reflect discovered candidates only - not full market coverage."}
+
+
 def run_company_discovery(payload):
     industry = (payload.get("industry") or "").strip()
     region = (payload.get("region") or "").strip()
@@ -13898,6 +14303,7 @@ def run_company_discovery(payload):
         return {"success": False, "status": f"Discovery query failed: {msg[:100]}", "candidates": 0}
     t = now()
     new_count, dup_count = 0, 0
+    verified_count, needs_count, invalid_count = 0, 0, 0
     for item in data:
         name = (item.get("name") or "").strip()
         if not name:
@@ -13909,16 +14315,32 @@ def run_company_discovery(payload):
         if db.query("SELECT id FROM discovery_candidates WHERE candidate_name=? LIMIT 1", (name,)):
             dup_count += 1
             continue
-        db.execute(
+        new_id = db.execute(
             "INSERT INTO discovery_candidates (industry, region, company_type, external_source, "
             "candidate_name, website, raw_json, status, duplicate_of, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (industry, region or None, company_type or None, f"gemini:{model_used}",
              name, website, json.dumps(item)[:2000], "NEW", None, t))
         new_count += 1
-    log_activity(f"Discovery: {new_count} new candidates for {industry}" + (f" / {region}" if region else ""),
+        try:
+            v = validate_candidate(new_id if isinstance(new_id, int) else
+                                   db.query("SELECT id FROM discovery_candidates WHERE candidate_name=? "
+                                            "ORDER BY id DESC LIMIT 1", (name,))[0]["id"])
+            st = (v.get("verification_status") or "")
+            if st == "VERIFIED":
+                verified_count += 1
+            elif st in ("PARTIALLY_VERIFIED", "INSUFFICIENT_DATA"):
+                needs_count += 1
+            else:
+                invalid_count += 1
+        except Exception:
+            needs_count += 1
+    log_activity(f"Discovery: {new_count} new candidates for {industry}" + (f" / {region}" if region else "") +
+                 f" ({verified_count} verified, {needs_count} need verification, {invalid_count} invalid)",
                  level="INFO")
-    return {"success": True, "status": f"Discovered {new_count} new candidates ({dup_count} duplicates skipped)",
-            "candidates": new_count}
+    return {"success": True,
+            "status": f"Discovered {new_count} new candidates ({dup_count} duplicates skipped)",
+            "candidates": new_count, "verified": verified_count,
+            "needs_verification": needs_count, "invalid": invalid_count}
 
 
 def list_discovery_candidates(status=None):
@@ -13945,6 +14367,15 @@ def import_discovery_candidate(cid):
     cand = rows[0]
     if cand["status"] == "IMPORTED":
         return {"success": False, "error": "Candidate already imported"}
+    try:
+        ensure_candidate_columns()
+        vrows = db.query("SELECT verification_status FROM discovery_candidates WHERE id=?", (cid,))
+        vstat = (vrows[0].get("verification_status") or "") if vrows else ""
+    except Exception:
+        vstat = ""
+    if vstat == "INVALID":
+        return {"success": False, "error": "Candidate is INVALID - review validation reason first",
+                "verification_status": vstat}
     existing = db.query("SELECT id FROM brands WHERE brand_name=? AND is_active=1 ORDER BY id DESC LIMIT 1",
                         (cand["candidate_name"],))
     if existing:
@@ -13965,6 +14396,7 @@ def import_discovery_candidate(cid):
         "company_type": cand.get("company_type"),
         "description": meta.get("description") or "",
         "keywords": meta.get("keywords") or "",
+        "verification_status": vstat if vstat in ("VERIFIED", "PARTIALLY_VERIFIED") else "UNVERIFIED",
     }, source="DISCOVERY", source_detail=cand.get("external_source") or "gemini", inspect_existing=False)
     if not bid:
         return {"success": False, "error": "Failed to create brand"}
@@ -14045,8 +14477,11 @@ def manual_analysis(data):
     bid = upsert_company(data, source="MANUAL", source_detail="manual form")
     if not bid:
         return {"success": False, "error": "Brand/Company Name is required."}
-    run_id = run_full_pipeline(bid, trigger="MANUAL")
-    return build_analysis_result(bid, run_id)
+    wid = (data.get("workflow_id") or "").strip() or None
+    run_id = run_full_pipeline(bid, trigger="MANUAL", direct=True, workflow_id=wid)
+    res = build_analysis_result(bid, run_id)
+    res["workflow_id"] = wid or get_active_workflow()
+    return res
 
 
 def build_analysis_result(brand_id, run_id=None):
@@ -14762,6 +15197,10 @@ class AgentServerHandler(BaseHTTPRequestHandler):
             elif path == "/api/discovery/candidates":
                 status = (qp.get("status") or [None])[0]
                 send_json(self, list_discovery_candidates(status))
+            elif path == "/api/discovery/summary":
+                send_json(self, discovery_summary())
+            elif path == "/api/regions":
+                send_json(self, {"success": True, "regions": REGIONS})
             elif path == "/api/scheduler/status":
                 send_json(self, scheduler.status())
             elif path == "/api/scheduler/activity":
@@ -14823,6 +15262,46 @@ class AgentServerHandler(BaseHTTPRequestHandler):
             # --- Workflow Self-Learning GET Endpoints ---
             elif path == "/api/workflow/list":
                 send_json(self, {"success": True, "workflows": workflow_list()})
+            elif path == "/api/workflow/active":
+                wid = get_active_workflow()
+                spec = SPEC_WORKFLOWS[wid]
+                rows = db.query("SELECT version FROM workflow_versions WHERE workflow_id=? AND status='ACTIVE' "
+                                "ORDER BY version DESC LIMIT 1", (wid,))
+                send_json(self, {"success": True, "workflow_id": wid, "name": spec["name"],
+                                 "visible": spec["visible"],
+                                 "version": rows[0]["version"] if rows else 1,
+                                 "spec_workflows": {k: {"name": v["name"], "visible": v["visible"]}
+                                                    for k, v in SPEC_WORKFLOWS.items()}})
+            elif path == "/api/workflow/runs":
+                cid = (qp.get("company_id") or [None])[0]
+                wid = (qp.get("workflow_id") or [None])[0]
+                try:
+                    lim = max(1, min(int((qp.get("limit") or [50])[0]), 200))
+                except Exception:
+                    lim = 50
+                q = "SELECT * FROM workflow_runs WHERE 1=1"
+                p = []
+                if cid:
+                    q += " AND company_id=?"
+                    p.append(int(cid))
+                if wid:
+                    q += " AND workflow_id=?"
+                    p.append(wid)
+                rows = db.query(q + f" ORDER BY id DESC LIMIT {lim}", tuple(p))
+                out = []
+                for r in rows:
+                    d = dict(r)
+                    for k in ("steps_json", "tools_json", "rag_json", "reasoning_json",
+                              "skipped_json", "plan_json"):
+                        try:
+                            d[k.replace("_json", "")] = safe_json_loads(
+                                d.get(k), [] if "steps" in k else {})
+                        except Exception:
+                            pass
+                    out.append(d)
+                send_json(self, {"success": True, "runs": out})
+            elif path == "/api/health/full":
+                send_json(self, system_health())
             elif path == "/api/workflow/demo":
                 send_json(self, workflow_create_demo())
             elif path == "/api/workflow/presets/create":
@@ -14916,7 +15395,8 @@ class AgentServerHandler(BaseHTTPRequestHandler):
             elif path == "/api/agent/run":
                 send_json(self, run_now(read_body(self), background=True))
             elif path == "/api/agent/run-all":
-                send_json(self, run_all_companies())
+                _wid = (read_body(self).get("workflow_id") or "").strip() or None
+                send_json(self, run_all_companies(workflow_id=_wid))
             elif path == "/api/workflow/presets":
                 send_json(self, {"success": True, "presets": WORKFLOW_PRESETS})
             elif path.startswith("/api/workflow/") and path.endswith("/config"):
@@ -14973,6 +15453,27 @@ class AgentServerHandler(BaseHTTPRequestHandler):
                     send_json(self, import_discovery_candidate(int(cid)))
             elif path == "/api/discovery/import-all":
                 send_json(self, import_all_discovery_candidates())
+            elif path == "/api/discovery/validate":
+                payload = read_body(self)
+                cid = payload.get("id") or payload.get("candidate_id")
+                if cid:
+                    send_json(self, validate_candidate(int(cid)))
+                else:
+                    rows = db.query("SELECT id FROM discovery_candidates WHERE status='NEW' ORDER BY id DESC LIMIT 50")
+                    done = {"verified": 0, "needs": 0, "invalid": 0}
+                    for r in rows:
+                        try:
+                            v = validate_candidate(r["id"])
+                            st = v.get("verification_status", "")
+                            if st == "VERIFIED":
+                                done["verified"] += 1
+                            elif st in ("PARTIALLY_VERIFIED", "INSUFFICIENT_DATA"):
+                                done["needs"] += 1
+                            else:
+                                done["invalid"] += 1
+                        except Exception:
+                            done["invalid"] += 1
+                    send_json(self, {"success": True, "checked": len(rows), **done})
             elif path == "/api/discovery/reject":
                 payload = read_body(self)
                 cid = payload.get("id") or payload.get("candidate_id")
@@ -15043,11 +15544,12 @@ class AgentServerHandler(BaseHTTPRequestHandler):
                     return
                 # Direct inline execution in background - returns instantly,
                 # dashboard polls live progress via /agent-state.
+                wid = (payload.get("workflow_id") or "").strip() or None
                 rid = create_run("REANALYZE", companies=[int(bid)])
 
-                def _reanalyze(cid=int(bid), _rid=rid):
+                def _reanalyze(cid=int(bid), _rid=rid, _wid=wid):
                     try:
-                        summary = run_company_direct(cid, _rid)
+                        summary = run_company_direct(cid, _rid, workflow_id=_wid)
                         finalize_run(_rid, "FAILED" if summary.get("errors") else "COMPLETED")
                     except Exception as e:
                         print(f"[ReAnalyze] company {cid} failed: {e}", flush=True)
@@ -15058,6 +15560,7 @@ class AgentServerHandler(BaseHTTPRequestHandler):
 
                 threading.Thread(target=_reanalyze, daemon=True, name="reanalyze-direct").start()
                 send_json(self, {"success": True, "run_id": rid,
+                                 "workflow_id": wid or get_active_workflow(),
                                  "message": "Re-analysis started - watch live progress on the dashboard."})
             elif path == "/agent/run-discover":
                 send_json(self, run_company_discovery(read_body(self)))
@@ -15463,6 +15966,9 @@ class AgentServerHandler(BaseHTTPRequestHandler):
                 send_json(self, workflow_create_demo())
             elif path == "/api/workflow/presets/create":
                 send_json(self, workflow_create_presets())
+            elif path == "/api/workflow/active":
+                payload = read_body(self)
+                send_json(self, set_active_workflow((payload.get("workflow_id") or "").strip()))
             elif path == "/api/workflow/auto-adaptation":
                 payload = read_body(self)
                 send_json(self, workflow_set_auto_adaptation(payload.get("enabled", True)))
@@ -15484,6 +15990,52 @@ class AgentServerHandler(BaseHTTPRequestHandler):
                 send_error(self, "Missing id")
             return
         send_error(self, "Endpoint not found", 404)
+
+
+def system_health():
+    """One combined health check (§31). Every flag comes from a real probe -
+    nothing is hardcoded. Used by the simple Start view health strip."""
+    checks = {}
+    checks["backend"] = True  # serving this response proves it
+    try:
+        db.query("SELECT 1 AS ok")
+        checks["database"] = True
+    except Exception as e:
+        checks["database"] = f"DB error: {e}"[:160]
+    try:
+        checks["scheduler"] = bool(scheduler.thread and scheduler.thread.is_alive())
+    except Exception:
+        checks["scheduler"] = False
+    try:
+        checks["worker"] = bool(runner.thread and runner.thread.is_alive())
+    except Exception:
+        checks["worker"] = False
+    try:
+        rows = db.query("SELECT workflow_id FROM workflow_definitions "
+                        "WHERE workflow_id IN ('brand_visibility_standard','rag_enhanced_analysis')")
+        checks["workflows"] = len(rows) == 2
+    except Exception:
+        checks["workflows"] = False
+    try:
+        checks["search"] = bool(requests_available and SERPAPI_KEY) or gemini_available
+    except Exception:
+        checks["search"] = False
+    try:
+        rh = rag_health() or {}
+        checks["rag"] = (rh.get("status") == "HEALTHY")
+    except Exception:
+        checks["rag"] = False
+    try:
+        checks["llm"] = bool(gemini_available or groq_available)
+    except Exception:
+        checks["llm"] = False
+    try:
+        db.query("SELECT id FROM learning_events LIMIT 1")
+        checks["learning"] = True
+    except Exception as e:
+        checks["learning"] = f"DB error: {e}"[:160]
+    ok = all(v is True for v in checks.values())
+    return {"success": True, "healthy": ok, "checks": checks}
 
 
 def agent_state():
