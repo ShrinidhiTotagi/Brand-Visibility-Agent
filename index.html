@@ -3932,12 +3932,17 @@
     }
 
     async function selectWorkflow(wfId) {
+        const changed = (selectedWorkflowId !== null && selectedWorkflowId !== wfId);
         selectedWorkflowId = wfId;
         document.querySelectorAll('#wf-workflows-list .list-item').forEach(el => {
             el.style.borderColor = (el.dataset.wfid === wfId) ? 'var(--accent-blue)' : 'var(--border-color)';
             el.style.boxShadow = (el.dataset.wfid === wfId) ? '0 0 0 1px var(--accent-blue)' : 'none';
         });
         await viewWorkflow(wfId);
+        if (changed) {
+            const card = document.querySelector(`#wf-workflows-list .list-item[data-wfid="${wfId}"] strong`);
+            showToast('Viewing workflow: ' + (card ? card.textContent : wfId), 'info');
+        }
     }
 
     async function loadWorkflows() {
@@ -4012,7 +4017,8 @@
                 el.style.borderColor = (el.dataset.wfid === wfId) ? 'var(--accent-blue)' : 'var(--border-color)';
                 el.style.boxShadow = (el.dataset.wfid === wfId) ? '0 0 0 1px var(--accent-blue)' : 'none';
             });
-            let html = `<div class="card-header"><div><div class="card-title">${wf.name}</div><div class="card-subtitle">${wf.workflow_id} - ${wf.description || ''}</div></div></div>`;
+            let html = `<div style="margin-bottom:12px;padding:8px 14px;border-radius:8px;background:rgba(59,130,246,0.08);border:1px solid var(--accent-blue);font-size:0.85rem;">👁️ Viewing workflow: <strong>${wf.name}</strong> <span style="color:var(--text-muted);">(${wf.workflow_id})</span></div>`;
+            html += `<div class="card-header"><div><div class="card-title">${wf.name}</div><div class="card-subtitle">${wf.workflow_id} - ${wf.description || ''}</div></div></div>`;
 
             html += '<div style="margin-bottom:12px;"><strong>Versions:</strong></div>';
             if (wf.versions && wf.versions.length > 0) {
