@@ -15870,7 +15870,7 @@ CREATE TABLE IF NOT EXISTS agent_observations (
     severity TEXT DEFAULT 'INFO',
     created_at TEXT DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS agent_decisions (
+CREATE TABLE IF NOT EXISTS agent_brain_decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     decision_type TEXT NOT NULL,
     observation_id INTEGER,
@@ -15893,7 +15893,7 @@ CREATE TABLE IF NOT EXISTS agent_outcomes (
     reflection TEXT,
     lesson_learned TEXT,
     created_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (decision_id) REFERENCES agent_decisions(id)
+    FOREIGN KEY (decision_id) REFERENCES agent_brain_decisions(id)
 );
 CREATE TABLE IF NOT EXISTS agent_strategy (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -15946,14 +15946,14 @@ class AgentDecision:
 
     def store(self):
         db.execute(
-            "INSERT INTO agent_decisions (decision_id, company_id, action, reason, confidence, status, decision_source, created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (f"DEC-{secrets.token_hex(4).upper()}", self.params.get("company_id"),
-             self.action, self.reasoning, self.confidence, "PENDING", "AGENT_BRAIN", now()))
+            "INSERT INTO agent_brain_decisions (decision_type, observation_id, reasoning, chosen_action, action_params, confidence, status, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (self.decision_type, self.observation_id, self.reasoning, self.action,
+             json.dumps(self.params or {}), self.confidence, "PENDING", now()))
         return db.query("SELECT last_insert_rowid() AS id")[0]["id"]
 
     def mark_executed(self):
         self.status = "EXECUTED"
-        db.execute("UPDATE agent_decisions SET status='EXECUTED' WHERE id=(SELECT last_insert_rowid())")
+        db.execute("UPDATE agent_brain_decisions SET status='EXECUTED' WHERE id=(SELECT last_insert_rowid())")
 
 
 class AgentOutcome:
@@ -16621,7 +16621,7 @@ def agent_brain_status():
     status = agent_brain.status()
     # Get recent observations
     observations = db.query("SELECT * FROM agent_observations ORDER BY id DESC LIMIT 20")
-    decisions = db.query("SELECT * FROM agent_decisions ORDER BY id DESC LIMIT 20")
+    decisions = db.query("SELECT * FROM agent_brain_decisions ORDER BY id DESC LIMIT 20")
     outcomes = db.query("SELECT * FROM agent_outcomes ORDER BY id DESC LIMIT 10")
     strategies = db.query("SELECT * FROM agent_strategy ORDER BY times_used DESC LIMIT 10")
     return {
