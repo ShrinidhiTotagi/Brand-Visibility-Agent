@@ -13887,7 +13887,12 @@ def run_company_discovery(payload):
         if not isinstance(data, list):
             return {"success": False, "status": "Invalid discovery response format", "candidates": 0}
     except Exception as e:
-        return {"success": False, "status": f"Discovery query failed: {str(e)[:100]}", "candidates": 0}
+        msg = str(e)
+        if "429" in msg or "rate_limit" in msg.lower():
+            return {"success": False, "candidates": 0, "rate_limited": True,
+                    "status": "AI providers are rate-limited right now (free-tier quota). "
+                              "Wait ~2 minutes and retry, or add companies via Manual / CSV import instead."}
+        return {"success": False, "status": f"Discovery query failed: {msg[:100]}", "candidates": 0}
     t = now()
     new_count, dup_count = 0, 0
     for item in data:
