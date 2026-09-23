@@ -14822,6 +14822,8 @@ class AgentServerHandler(BaseHTTPRequestHandler):
                 send_json(self, {"success": True, "workflows": workflow_list()})
             elif path == "/api/workflow/demo":
                 send_json(self, workflow_create_demo())
+            elif path == "/api/workflow/presets/create":
+                send_json(self, workflow_create_presets())
             elif path.startswith("/api/workflow/") and "/adaptations" in path:
                 wf_id = path.split("/")[3]
                 send_json(self, {"success": True, "adaptations": workflow_adaptations(wf_id)})
@@ -15456,6 +15458,8 @@ class AgentServerHandler(BaseHTTPRequestHandler):
                 send_json(self, {"success": True, "events": workflow_events(wf_id)})
             elif path == "/api/workflow/demo":
                 send_json(self, workflow_create_demo())
+            elif path == "/api/workflow/presets/create":
+                send_json(self, workflow_create_presets())
             elif path == "/api/workflow/auto-adaptation":
                 payload = read_body(self)
                 send_json(self, workflow_set_auto_adaptation(payload.get("enabled", True)))
@@ -17320,6 +17324,61 @@ def workflow_compare_versions(wf_id, va, vb):
 # ---------------------------------------------------------------------------
 # 19.9 DEMO WORKFLOW
 # ---------------------------------------------------------------------------
+
+def workflow_create_presets():
+    """Create the two production workflows for this agent (idempotent).
+    1. Brand Visibility Audit - full pipeline for a company.
+    2. Competitor Watch - competitor-focused monitoring loop."""
+    presets = [
+        {
+            "name": "Brand Visibility Audit",
+            "description": "Full brand analysis pipeline: collect, queries, AI search, brand + competitors, gaps, recommendations, store.",
+            "steps": [
+                {"id": "collect", "operation": "COLLECT_WEBSITE_DATA", "agent": "website_content", "tool": "website_scraper"},
+                {"id": "validate", "operation": "VALIDATE_DATA", "agent": "system", "tool": None},
+                {"id": "queries", "operation": "GENERATE_QUERIES", "agent": "visibility_analyst", "tool": "gemini_queries"},
+                {"id": "ai_search", "operation": "RUN_AI_SEARCH", "agent": "visibility_analyst", "tool": "ai_search"},
+                {"id": "brand", "operation": "ANALYZE_BRAND", "agent": "visibility_analyst", "tool": "gemini_analyze"},
+                {"id": "competitors", "operation": "ANALYZE_COMPETITORS", "agent": "visibility_analyst", "tool": "gemini_competitors"},
+                {"id": "gaps", "operation": "DETECT_CONTENT_GAPS", "agent": "visibility_analyst", "tool": "gemini_gaps"},
+                {"id": "recommend", "operation": "GENERATE_RECOMMENDATIONS", "agent": "visibility_analyst", "tool": "gemini_recommend"},
+                {"id": "changes", "operation": "DETECT_CHANGES", "agent": "system", "tool": None},
+                {"id": "store", "operation": "STORE_ANALYSIS", "agent": "system", "tool": None},
+                {"id": "learn", "operation": "UPDATE_LEARNING", "agent": "system", "tool": None},
+            ],
+            "dependencies": {"validate": ["collect"], "queries": ["validate"], "ai_search": ["queries"],
+                             "brand": ["validate"], "competitors": ["brand"], "gaps": ["brand", "competitors"],
+                             "recommend": ["competitors", "gaps"], "changes": ["collect", "validate"],
+                             "store": ["recommend", "changes"], "learn": ["store"]},
+        },
+        {
+            "name": "Competitor Watch",
+            "description": "Competitor monitoring loop: collect, benchmark competitors, gaps, recommendations, store.",
+            "steps": [
+                {"id": "collect", "operation": "COLLECT_WEBSITE_DATA", "agent": "website_content", "tool": "website_scraper"},
+                {"id": "competitors", "operation": "ANALYZE_COMPETITORS", "agent": "visibility_analyst", "tool": "gemini_competitors"},
+                {"id": "gaps", "operation": "DETECT_CONTENT_GAPS", "agent": "visibility_analyst", "tool": "gemini_gaps"},
+                {"id": "recommend", "operation": "GENERATE_RECOMMENDATIONS", "agent": "visibility_analyst", "tool": "gemini_recommend"},
+                {"id": "changes", "operation": "DETECT_CHANGES", "agent": "system", "tool": None},
+                {"id": "store", "operation": "STORE_ANALYSIS", "agent": "system", "tool": None},
+            ],
+            "dependencies": {"competitors": ["collect"], "gaps": ["competitors"],
+                             "recommend": ["gaps"], "changes": ["collect"],
+                             "store": ["recommend", "changes"]},
+        },
+    ]
+    created = []
+    for p in presets:
+        existing = db.query("SELECT workflow_id FROM workflow_definitions WHERE name=? LIMIT 1", (p["name"],))
+        if existing:
+            created.append({"workflow_id": existing[0]["workflow_id"], "name": p["name"], "existing": True})
+            continue
+        wf = workflow_create(name=p["name"], description=p["description"], steps=p["steps"],
+                             dependencies=p["dependencies"], created_by="PRESETS")
+        workflow_activate_version(wf["workflow_id"], 1)
+        created.append({"workflow_id": wf["workflow_id"], "name": p["name"], "existing": False})
+    return {"success": True, "workflows": created}
+
 
 def workflow_create_demo():
     """Create a deterministic demo workflow with V1 and V2."""

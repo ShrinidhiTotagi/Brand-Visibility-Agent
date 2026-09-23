@@ -1006,6 +1006,7 @@
                         </div>
                         <div style="display:flex;gap:8px;">
                             <button class="btn-secondary btn-sm" onclick="loadWorkflows()">🔄 Refresh</button>
+                            <button class="btn-secondary btn-sm" onclick="createPresetWorkflows()">⚡ Create 2 Preset Workflows</button>
                             <button class="btn-secondary btn-sm" onclick="createDemoWorkflow()">🎯 Demo Workflow</button>
                         </div>
                     </div>
@@ -3916,6 +3917,28 @@
 
     // ── Workflow Self-Learning UI ──────────────────────────────────────────
     let currentWorkflow = null;
+    let selectedWorkflowId = null;
+
+    async function createPresetWorkflows() {
+        try {
+            const data = await apiPost('/api/workflow/presets/create', {});
+            const wfs = data.workflows || [];
+            const fresh = wfs.filter(w => !w.existing).length;
+            showToast(fresh > 0 ? `Created ${fresh} preset workflow(s).` : 'Preset workflows already exist.', 'success');
+            await loadWorkflows();
+            const firstNew = wfs.length ? wfs[0].workflow_id : null;
+            if (firstNew) selectWorkflow(firstNew);
+        } catch (e) { showToast('Error: ' + e.message, 'error'); }
+    }
+
+    async function selectWorkflow(wfId) {
+        selectedWorkflowId = wfId;
+        document.querySelectorAll('#wf-workflows-list .list-item').forEach(el => {
+            el.style.borderColor = (el.dataset.wfid === wfId) ? 'var(--accent-blue)' : 'var(--border-color)';
+            el.style.boxShadow = (el.dataset.wfid === wfId) ? '0 0 0 1px var(--accent-blue)' : 'none';
+        });
+        await viewWorkflow(wfId);
+    }
 
     async function loadWorkflows() {
         try {
@@ -3929,13 +3952,13 @@
                 html += '<div class="form-hint">No workflows yet. Create a demo workflow to get started.</div>';
             }
             wfs.forEach(wf => {
-                html += `<div class="list-item" style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:var(--bg-card);border-radius:8px;border:1px solid var(--border-color);">
+                html += `<div class="list-item" data-wfid="${wf.workflow_id}" onclick="selectWorkflow('${wf.workflow_id}')" style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:var(--bg-card);border-radius:8px;border:1px solid var(--border-color);cursor:pointer;">
                     <div>
                         <strong>${wf.name}</strong>
                         <span style="margin-left:8px;padding:2px 6px;border-radius:4px;font-size:11px;background:${wf.status === 'ACTIVE' ? 'var(--green-soft)' : 'var(--yellow-soft)'};color:${wf.status === 'ACTIVE' ? '#10b981' : '#f59e0b'}">${wf.status}</span>
                         <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">${wf.workflow_id} - ${wf.description || 'No description'}</div>
                     </div>
-                    <div style="display:flex;gap:6px;">
+                    <div style="display:flex;gap:6px;" onclick="event.stopPropagation();">
                         <button class="btn-secondary btn-sm" onclick="viewWorkflow('${wf.workflow_id}')">View</button>
                         <button class="btn-secondary btn-sm" onclick="viewAdaptations('${wf.workflow_id}')">Adaptations</button>
                         <button class="btn-secondary btn-sm" onclick="viewLearning('${wf.workflow_id}')">Learning</button>
@@ -3945,11 +3968,18 @@
             html += '</div>';
             document.getElementById('wf-workflows-list').innerHTML = html;
 
-            // Load adaptations and learning counts
+            // Auto-load: keep previous selection, else first workflow.
             if (wfs.length > 0) {
-                const adaptData = await apiGet(`/api/workflow/${wfs[0].workflow_id}/adaptations`);
+                const keep = wfs.some(w => w.workflow_id === selectedWorkflowId) ? selectedWorkflowId : wfs[0].workflow_id;
+                await selectWorkflow(keep);
+            }
+
+            // Load adaptations and learning counts for the selected workflow
+            if (wfs.length > 0) {
+                const wid = selectedWorkflowId || wfs[0].workflow_id;
+                const adaptData = await apiGet(`/api/workflow/${wid}/adaptations`);
                 document.getElementById('wf-adaptations').textContent = (adaptData.adaptations || []).length;
-                const learnData = await apiGet(`/api/workflow/${wfs[0].workflow_id}/learning`);
+                const learnData = await apiGet(`/api/workflow/${wid}/learning`);
                 document.getElementById('wf-patterns').textContent = (learnData.patterns || []).length;
             }
         } catch (e) {
@@ -3961,13 +3991,13 @@
         try {
             const data = await apiPost('/api/workflow/demo', {});
             if (data.workflow_id) {
-                toast('Demo workflow created!', 'success');
+                showToast('Demo workflow created!', 'success');
                 loadWorkflows();
                 viewWorkflow(data.workflow_id);
             } else {
-                toast('Failed to create demo workflow', 'error');
+                showToast('Failed to create demo workflow', 'error');
             }
-        } catch (e) { toast('Error: ' + e.message, 'error'); }
+        } catch (e) { showToast('Error: ' + e.message, 'error'); }
     }
 
     async function viewWorkflow(wfId) {
@@ -3977,6 +4007,11 @@
             if (!wf) return;
 
             currentWorkflow = wf;
+            selectedWorkflowId = wfId;
+            document.querySelectorAll('#wf-workflows-list .list-item').forEach(el => {
+                el.style.borderColor = (el.dataset.wfid === wfId) ? 'var(--accent-blue)' : 'var(--border-color)';
+                el.style.boxShadow = (el.dataset.wfid === wfId) ? '0 0 0 1px var(--accent-blue)' : 'none';
+            });
             let html = `<div class="card-header"><div><div class="card-title">${wf.name}</div><div class="card-subtitle">${wf.workflow_id} - ${wf.description || ''}</div></div></div>`;
 
             html += '<div style="margin-bottom:12px;"><strong>Versions:</strong></div>';
