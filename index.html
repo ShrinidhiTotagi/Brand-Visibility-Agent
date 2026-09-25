@@ -3381,7 +3381,11 @@
             const r = await apiPost('/api/rag/search', { company_id: parseInt(cid, 10), query: q, top_k: 5 });
             if (!r.success) { box.innerHTML = `<div class="banner rose"><div>${esc(r.error || 'Failed')}</div></div>`; return; }
             if (r.status === 'INSUFFICIENT_RELEVANT_CONTEXT' || !(r.results || []).length) {
-                box.innerHTML = '<div class="banner amber"><div><div class="banner-title">INSUFFICIENT_RELEVANT_CONTEXT</div>No sufficiently similar indexed knowledge. Index the company first.</div></div>';
+                const idxDocs = (r.retrieval_metadata || {}).indexed_docs || 0;
+                const msg = idxDocs > 0
+                    ? `The company is indexed (${idxDocs} chunks) but nothing similar to your question was found. Try different wording, or re-index for fresh results.`
+                    : 'This company has NO indexed knowledge yet — click "Index company" first, then search again.';
+                box.innerHTML = '<div class="banner amber"><div><div class="banner-title">INSUFFICIENT_RELEVANT_CONTEXT</div>' + esc(msg) + '</div></div>';
                 return;
             }
             box.innerHTML = r.results.map(x => `<div class="change-row"><div class="change-body"><b>${esc(x.source_type || '')}</b> · similarity ${x.similarity} · ${esc((x.metadata || {}).verification_status || '')}<div>${esc((x.content || '').slice(0, 220))}</div><div class="form-hint">${esc(x.document_id || '')} · record ${esc(x.source_record_id || '')}</div></div></div>`).join('');

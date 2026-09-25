@@ -4,6 +4,12 @@
 *.db-wal
 *.db-journal
 *.bak
+# Local test/repair artifacts (never pushed)
+snapshot_local.py
+test_rag_fallback.py
+repair_rag.py
+cleanup_rag_test.py
+upload_snapshot.db
 # Portal-upload builds (re-generated from agent.js; uploaded manually, not via git)
 agent.js
 agent_portal.js

@@ -9682,14 +9682,14 @@ def rag_index_company(company_id, source_types=None, batch_size=None):
                                                            status, created_at, updated_at)
                                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                             """, (m["document_id"], company_id, m["source_type"], m["record_id"], m["hash"],
-                                  c["text"][:300], vector_backend, RAG_COLLECTION, "none",
+                                  c["text"][:6000], vector_backend, RAG_COLLECTION, "none",
                                   c["idx"], len(m["chunks"]), m["verification"],
                                   m["source_updated"], t, None, json.dumps(m["meta_extra"])[:2000], "ACTIVE", t, t))
                             indexed += 1
                         else:
                             db.execute("UPDATE rag_documents SET content_hash=?, content_preview=?, indexed_at=?, "
                                        "updated_at=?, status='ACTIVE' WHERE document_id=? AND chunk_index=?",
-                                       (m["hash"], c["text"][:300], t, t, m["document_id"], c["idx"]))
+                                       (m["hash"], c["text"][:6000], t, t, m["document_id"], c["idx"]))
                             updated += 1
                         _rag_log_event(m["document_id"], company_id, "INDEXED" if m["is_new"] else "UPDATED",
                                        m["source_type"], m["record_id"], old_hash=m.get("old_hash", ""),
@@ -9731,7 +9731,7 @@ def rag_index_company(company_id, source_types=None, batch_size=None):
                 else:
                     db.execute("UPDATE rag_documents SET content_hash=?, content_preview=?, indexed_at=?, "
                                "updated_at=?, status='ACTIVE' WHERE document_id=? AND chunk_index=?",
-                               (m["hash"], c["text"][:300], t, t, m["document_id"], c["idx"]))
+                               (m["hash"], c["text"][:6000], t, t, m["document_id"], c["idx"]))
                     updated += 1
                 _rag_log_event(m["document_id"], company_id, "INDEXED" if m["is_new"] else "UPDATED",
                                m["source_type"], m["record_id"], old_hash=m.get("old_hash", ""),
@@ -9943,16 +9943,21 @@ def rag_search(company_id, query, top_k=None, filters=None, request_id=None):
     out = [r for r in out if r["similarity"] >= min_sim][:top_k]
     status = "SUCCESS" if out else "INSUFFICIENT"
     _rag_audit(request_id, company_id, query, top_k, len(out), eff_backend, eff_model, status, lat())
+    try:
+        idx_count = db.query("SELECT COUNT(*) AS c FROM rag_documents WHERE company_id=? AND status='ACTIVE'",
+                             (company_id,))[0]["c"]
+    except Exception:
+        idx_count = 0
     if not out:
         return {"success": True, "query": query, "results": [],
                 "status": "INSUFFICIENT_RELEVANT_CONTEXT",
                 "stale_excluded": stale_excluded,
                 "retrieval_metadata": {"backend": eff_backend, "embedding_model": eff_model,
-                                       "count": 0}}
+                                       "count": 0, "indexed_docs": idx_count}}
     return {"success": True, "query": query, "results": out, "status": "SUCCESS",
             "stale_excluded": stale_excluded,
             "retrieval_metadata": {"backend": eff_backend, "embedding_model": eff_model,
-                                   "count": len(out)}}
+                                   "count": len(out), "indexed_docs": idx_count}}
 
 
 def mcp_read_knowledge(company_id, auth, limit=10):
