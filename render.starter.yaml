@@ -1,0 +1,25 @@
+# Render blueprint (STARTER tier, $7/mo): full backend + persistent DB + always-on.
+# To upgrade: copy this over render.yaml (or rename), commit, push, then in
+# Render dashboard change the service plan to Starter. Data persists via disk.
+services:
+  - type: web
+    name: brand-visibility-agent
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python agent.py
+    disk:
+      name: agent-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: AGENT_DB_PATH
+        value: /var/data/agent_storage.db
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: SERPAPI_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
