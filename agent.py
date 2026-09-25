@@ -9650,19 +9650,56 @@ def rag_index_company(company_id, source_types=None, batch_size=None):
             if not source_types or d["source_type"] in source_types]
     indexed = updated = skipped = failed = 0
     coll = None
+    vector_backend = "chroma"
     try:
         coll = rag_collection()
     except Exception as e:
-        for d in docs:
-            _rag_log_event("", company_id, "FAILED", d["source_type"], d["source_record_id"],
-                           status="FAILED", reason=f"vector backend unavailable: {str(e)[:200]}")
-        return {"success": False, "error": "Vector backend unavailable.", "indexed": 0, "updated": 0,
-                "skipped": 0, "failed": len(docs)}
+        if _rag_cfg("RAG_VECTOR_OPTIONAL", "1") != "1":
+            for d in docs:
+                _rag_log_event("", company_id, "FAILED", d["source_type"], d["source_record_id"],
+                               status="FAILED", reason=f"vector backend unavailable: {str(e)[:200]}")
+            return {"success": False, "error": "Vector backend unavailable.", "indexed": 0, "updated": 0,
+                    "skipped": 0, "failed": len(docs)}
+        print(f"[RAG] Chroma unavailable ({str(e)[:140]}); falling back to "
+              f"SQLite keyword store.", flush=True)
+        vector_backend = "sqlite-keyword-fallback"
     batch_texts, batch_meta = [], []
     def _flush():
         nonlocal indexed, updated, failed
         if not batch_texts:
             return True
+        if coll is None:
+            t = now()
+            for m in batch_meta:
+                try:
+                    for c in m["chunks"]:
+                        if m["is_new"]:
+                            db.execute("""
+                                INSERT INTO rag_documents (document_id, company_id, source_type, source_record_id,
+                                                           content_hash, content_preview, vector_backend, collection_name,
+                                                           embedding_model, chunk_index, chunk_count, verification_status,
+                                                           source_updated_at, indexed_at, last_retrieved_at, metadata_json,
+                                                           status, created_at, updated_at)
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            """, (m["document_id"], company_id, m["source_type"], m["record_id"], m["hash"],
+                                  c["text"][:300], vector_backend, RAG_COLLECTION, "none",
+                                  c["idx"], len(m["chunks"]), m["verification"],
+                                  m["source_updated"], t, None, json.dumps(m["meta_extra"])[:2000], "ACTIVE", t, t))
+                            indexed += 1
+                        else:
+                            db.execute("UPDATE rag_documents SET content_hash=?, content_preview=?, indexed_at=?, "
+                                       "updated_at=?, status='ACTIVE' WHERE document_id=? AND chunk_index=?",
+                                       (m["hash"], c["text"][:300], t, t, m["document_id"], c["idx"]))
+                            updated += 1
+                        _rag_log_event(m["document_id"], company_id, "INDEXED" if m["is_new"] else "UPDATED",
+                                       m["source_type"], m["record_id"], old_hash=m.get("old_hash", ""),
+                                       new_hash=m["hash"])
+                except Exception as e:
+                    for c in m["chunks"]:
+                        _rag_log_event(m["document_id"], company_id, "FAILED", m["source_type"], m["record_id"],
+                                       status="FAILED", reason=f"store failed: {str(e)[:200]}")
+                        failed += len(m["chunks"])
+                return True
         try:
             coll.upsert(ids=[c["cid"] for m in batch_meta for c in m["chunks"]],
                         documents=[c["text"] for m in batch_meta for c in m["chunks"]],
@@ -9687,7 +9724,7 @@ def rag_index_company(company_id, source_types=None, batch_size=None):
                                                    status, created_at, updated_at)
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, (m["document_id"], company_id, m["source_type"], m["record_id"], m["hash"],
-                          c["text"][:300], "chroma", RAG_COLLECTION, _rag_cfg("RAG_EMBEDDING_MODEL",
+                          c["text"][:300], vector_backend, RAG_COLLECTION, _rag_cfg("RAG_EMBEDDING_MODEL",
                           "gemini-embedding-001"), c["idx"], len(m["chunks"]), m["verification"],
                           m["source_updated"], t, None, json.dumps(m["meta_extra"])[:2000], "ACTIVE", t, t))
                     indexed += 1
@@ -9773,6 +9810,48 @@ def _rag_source_current(source_type, record_id, company_id):
     return None, None
 
 
+def _rag_sqlite_search_company(company_id, query="", where=None, limit=60):
+    """Honest no-vector fallback (§19): keyword-overlap over the SQLite
+    chunk store (rag_documents). Chroma-shaped result so the caller's
+    rerank/verify/threshold pipeline applies unchanged. None = unusable."""
+    try:
+        where = where or {}
+        terms = [t.lower() for t in re.findall(r"[a-z]{4,}", str(query or ""))]
+        terms = [t for t in terms if t not in ("with", "from", "that", "this", "what", "when")]
+        if not terms:
+            return None
+        rows = db.query("SELECT document_id, content_preview, chunk_index, source_type, "
+                        "verification_status, source_record_id FROM rag_documents "
+                        "WHERE company_id=? AND status='ACTIVE' LIMIT ?", (company_id, 2000))
+        st = where.get("source_type")
+        vs = where.get("verification_status")
+        scored = []
+        for r in rows:
+            if st and r.get("source_type") != st:
+                continue
+            if vs and r.get("verification_status") != vs:
+                continue
+            text = (r.get("content_preview") or "").lower()
+            if not text:
+                continue
+            hit = sum(1 for t in terms if t in text)
+            if not hit:
+                continue
+            scored.append((hit / max(1, len(terms)), r))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        scored = scored[:limit]
+        ids, docs, metas, dists = [], [], [], []
+        for sim, r in scored:
+            ids.append(f"{r['document_id']}#c{r['chunk_index']}")
+            docs.append(r["content_preview"] or "")
+            metas.append({"company_id": company_id, "source_type": r.get("source_type"),
+                          "document_id": r["document_id"], "verification_status": r.get("verification_status")})
+            dists.append(round(max(0.0, 1.0 - sim), 4))
+        return {"ids": [ids], "documents": [docs], "metadatas": [metas], "distances": [dists]}
+    except Exception:
+        return None
+
+
 def rag_search(company_id, query, top_k=None, filters=None, request_id=None):
     """Vector retrieval (§19-22): embed -> filtered similarity search ->
     company re-verification -> freshness check -> deterministic rerank ->
@@ -9802,13 +9881,30 @@ def rag_search(company_id, query, top_k=None, filters=None, request_id=None):
     vs = (filters or {}).get("verification_status")
     if vs:
         where["verification_status"] = vs
+    eff_backend = "chroma"
+    eff_model = _rag_cfg("RAG_EMBEDDING_MODEL", "")
     try:
         coll = rag_collection()
         res = coll.query(query_texts=[query], n_results=min(top_k * 3, 60), where=where,
                          include=["documents", "metadatas", "distances"])
     except Exception as e:
-        _rag_audit(request_id, company_id, query, top_k, 0, "chroma", "", "FAILED", lat())
-        return {"success": False, "error": f"Vector backend unavailable: {str(e)[:200]}"}
+        backend_label = "chroma"
+        if _rag_cfg("RAG_VECTOR_OPTIONAL", "1") == "1":
+            fb = _rag_sqlite_search_company(company_id, query, where=where)
+            backend_label = "sqlite-keyword-fallback"
+            if fb is not None:
+                res = fb
+                eff_backend = "sqlite-keyword-fallback"
+                eff_model = "none"
+            else:
+                _rag_audit(request_id, company_id, query, top_k, 0, backend_label, "none", "FAILED", lat())
+                return {"success": True, "query": query, "results": [],
+                        "status": "INSUFFICIENT_RELEVANT_CONTEXT", "stale_excluded": 0,
+                        "retrieval_metadata": {"backend": backend_label, "embedding_model": "none",
+                                               "count": 0, "error": str(e)[:140]}}
+        else:
+            _rag_audit(request_id, company_id, query, top_k, 0, backend_label, "", "FAILED", lat())
+            return {"success": False, "error": f"Vector backend unavailable: {str(e)[:200]}"}
     ids = (res.get("ids") or [[]])[0]
     docs = (res.get("documents") or [[]])[0]
     metas = (res.get("metadatas") or [[]])[0]
@@ -9846,17 +9942,16 @@ def rag_search(company_id, query, top_k=None, filters=None, request_id=None):
              reverse=True)
     out = [r for r in out if r["similarity"] >= min_sim][:top_k]
     status = "SUCCESS" if out else "INSUFFICIENT"
-    _rag_audit(request_id, company_id, query, top_k, len(out), "chroma", "", status, lat())
+    _rag_audit(request_id, company_id, query, top_k, len(out), eff_backend, eff_model, status, lat())
     if not out:
         return {"success": True, "query": query, "results": [],
                 "status": "INSUFFICIENT_RELEVANT_CONTEXT",
                 "stale_excluded": stale_excluded,
-                "retrieval_metadata": {"backend": "chroma", "embedding_model": _rag_cfg(
-                    "RAG_EMBEDDING_MODEL", ""), "count": 0}}
+                "retrieval_metadata": {"backend": eff_backend, "embedding_model": eff_model,
+                                       "count": 0}}
     return {"success": True, "query": query, "results": out, "status": "SUCCESS",
             "stale_excluded": stale_excluded,
-            "retrieval_metadata": {"backend": "chroma",
-                                   "embedding_model": _rag_cfg("RAG_EMBEDDING_MODEL", ""),
+            "retrieval_metadata": {"backend": eff_backend, "embedding_model": eff_model,
                                    "count": len(out)}}
 
 
@@ -9959,25 +10054,28 @@ def _rag_audit(request_id, company_id, query, top_k, result_count, backend, mode
 
 
 def rag_health():
-    """RAG health (§36): honest backend + embedding status. Local all-MiniLM-L6-v2 via ChromaDB."""
+    """RAG health (§36): honest backend + embedding status. Local all-MiniLM-L6-v2 via
+    ChromaDB when installed; otherwise the SQLite keyword store is reported."""
+    active = db.query("SELECT COUNT(*) AS c FROM rag_documents WHERE status='ACTIVE'")[0]["c"]
+    failed = db.query("SELECT COUNT(*) AS c FROM rag_index_events WHERE event_type='FAILED'")[0]["c"]
+    last = db.query("SELECT MAX(created_at) AS t FROM rag_index_events")
     try:
         coll = rag_collection()
         count = coll.count()
         backend, backend_status = "chroma", "HEALTHY"
+        collection_status = f"{RAG_COLLECTION}: {count} vectors + {active} sqlite rows"
+        embedding_status = "HEALTHY"
     except Exception as e:
-        return {"success": True, "backend": "chroma", "backend_status": "UNAVAILABLE",
-                "embedding_provider": "local-minilm", "embedding_status": "UNKNOWN",
-                "collection_status": f"unavailable: {str(e)[:150]}",
-                "indexed_documents": 0, "failed_documents": 0, "last_index_at": None,
-                "status": "UNAVAILABLE"}
-    active = db.query("SELECT COUNT(*) AS c FROM rag_documents WHERE status='ACTIVE'")[0]["c"]
-    failed = db.query("SELECT COUNT(*) AS c FROM rag_index_events WHERE event_type='FAILED'")[0]["c"]
-    last = db.query("SELECT MAX(created_at) AS t FROM rag_index_events")
-    return {"success": True, "backend": "chroma", "backend_status": backend_status,
-            "embedding_provider": "local-minilm", "embedding_status": "HEALTHY",
-            "collection_status": f"{RAG_COLLECTION}: {count} vectors",
+        backend, backend_status = "sqlite-keyword-fallback", "ACTIVE" if active else "EMPTY"
+        collection_status = f"chroma unavailable: {str(e)[:140]}"
+        embedding_status = "NONE"
+    return {"success": True, "backend": backend, "backend_status": backend_status,
+            "embedding_provider": "local-minilm" if backend == "chroma" else "none",
+            "embedding_status": embedding_status,
+            "collection_status": collection_status,
             "indexed_documents": active, "failed_documents": failed,
-            "last_index_at": (last[0].get("t") if last else None), "status": "HEALTHY"}
+            "last_index_at": (last[0].get("t") if last else None),
+            "status": "HEALTHY" if (active or backend == "chroma") else "EMPTY"}
 
 
 def retrieve_relevant_context(company_id, query="", top_k=None, filters=None):
@@ -9995,8 +10093,8 @@ def retrieve_relevant_context(company_id, query="", top_k=None, filters=None):
                                       "reason": "empty query cannot embed", **base.get("retrieval_metadata", {})}
         return base
     res = rag_search(company_id, query, top_k=top_k, filters=filters)
-    if not res.get("success") and ("UNAVAILABLE" in str(res.get("error", "")) or
-                                   "DISABLED" in str(res.get("error", ""))):
+    if not res.get("success") and ("UNAVAILABLE" in str(res.get("error", "")).upper() or
+                                   "DISABLED" in str(res.get("error", "")).upper()):
         base = _retrieve_keyword_fallback(company_id, query, top_k, filters)
         base["retrieval_metadata"] = {"backend": "keyword-fallback", "vector_backend": "unavailable",
                                       **base.get("retrieval_metadata", {})}
