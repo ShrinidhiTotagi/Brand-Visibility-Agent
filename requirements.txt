@@ -1,3 +1,5 @@
-# No third-party dependencies: agent.py is stdlib-only.
-# Optional integrations (groq, google-generativeai, requests, pymysql, chromadb)
-# are imported lazily and disable gracefully when absent.
+# Provider SDKs (pure-Python wheels). Everything else in agent.py is stdlib-only.
+# Each integration disables gracefully if its package is absent.
+groq
+google-generativeai
+requests
