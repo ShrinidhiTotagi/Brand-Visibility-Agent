@@ -1,0 +1,22 @@
+# Render blueprint: full Python backend (all engines), persistent SQLite disk.
+services:
+  - type: web
+    name: brand-visibility-agent
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python agent.py
+    disk:
+      name: agent-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: AGENT_DB_PATH
+        value: /var/data/agent_storage.db
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: SERPAPI_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false

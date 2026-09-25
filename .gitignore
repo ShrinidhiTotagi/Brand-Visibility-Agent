@@ -1,14 +1,17 @@
-__pycache__/
-*.pyc
-*.pyo
 .env
 *.db
+*.db-shm
+*.db-wal
 *.db-journal
-backups/
-.pytest_cache/
-*.log
-error.log
-stdout.log
-stderr.log
+*.bak
+# Portal-upload builds (re-generated from agent.js; uploaded manually, not via git)
+agent.js
+agent_portal.js
+index_portal.html
+portal_routes.txt
+# Node / OS noise
+node_modules/
+__pycache__/
+.DS_Store
+Thumbs.db
 chroma_db/
-check_tables.py

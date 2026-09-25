@@ -258,7 +258,7 @@
 <body>
 
 <!-- LOGIN SCREEN -->
-<div id="login-screen" style="position:fixed;inset:0;z-index:9999;background:var(--bg-primary);display:flex;align-items:center;justify-content:center;">
+<div id="login-screen" style="position:fixed;inset:0;z-index:9999;background:var(--bg-primary);display:none;align-items:center;justify-content:center;">
     <div style="width:380px;padding:40px;background:var(--bg-card);border-radius:16px;border:1px solid var(--border-color);box-shadow:var(--shadow-md);">
         <div style="text-align:center;margin-bottom:32px;">
             <div style="width:56px;height:56px;border-radius:14px;background:var(--gradient-primary);display:inline-flex;align-items:center;justify-content:center;margin-bottom:16px;">
@@ -362,11 +362,7 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 4v16M4 9h5M4 15h5" stroke-linecap="round"/></svg>
                 <span>Framework</span>
             </li>
-            <li class="nav-item" data-view="workflow" onclick="switchView('workflow')">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                <span>Workflows</span>
-            </li>
-            <li class="nav-item" data-view="about" onclick="switchView('about')">
+            <li class="nav-item" data-view="about" onclick="switchView('about')">                
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4m0-4h.01" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 <span>About Agent v2</span>
             </li>
@@ -1065,35 +1061,6 @@
                 </div>
             </section>
 
-            <!-- WORKFLOW SELF-LEARNING -->
-            <section id="workflow-view" class="view-panel">
-                <div class="card" style="max-width:1200px;margin:0 auto;">
-                    <div class="card-header">
-                        <div>
-                            <div class="card-title">Workflow Self-Learning & Adaptation</div>
-                            <div class="card-subtitle">Detects workflow changes, adapts orchestration, learns from outcomes</div>
-                        </div>
-                        <div style="display:flex;gap:8px;">
-                            <button class="btn-secondary btn-sm" onclick="loadWorkflows()">🔄 Refresh</button>
-                            <button class="btn-secondary btn-sm" onclick="createPresetWorkflows()">⚡ Create 2 Preset Workflows</button>
-                            <button class="btn-secondary btn-sm" onclick="createDemoWorkflow()">🎯 Demo Workflow</button>
-                        </div>
-                    </div>
-
-                    <div class="metrics-cards-grid" style="margin-bottom:16px;">
-                        <div class="metric-card"><div class="metric-value" id="wf-total">0</div><div class="metric-label">Workflows</div></div>
-                        <div class="metric-card"><div class="metric-value" id="wf-active">0</div><div class="metric-label">Active</div></div>
-                        <div class="metric-card"><div class="metric-value" id="wf-adaptations">0</div><div class="metric-label">Adaptations</div></div>
-                        <div class="metric-card"><div class="metric-value" id="wf-patterns">0</div><div class="metric-label">Learned Patterns</div></div>
-                    </div>
-
-                    <div id="wf-workflows-list" style="margin-top:12px;"></div>
-                    <div id="wf-diff-result" style="margin-top:12px;display:none;"></div>
-                    <div id="wf-adaptations" style="margin-top:12px;"></div>
-                    <div id="wf-learning" style="margin-top:12px;"></div>
-                </div>
-            </section>
-
             <!-- ABOUT -->
             <section id="about-view" class="view-panel">
                 <div class="card" style="max-width:960px;margin:0 auto;">
@@ -1136,7 +1103,6 @@
         'autonomous-loop': 'Autonomous Execution Loop - Goal → Plan → Reason → Tool → Observe → Learn',
         'manager': 'Manager Agent - Multi-Agent Coordination',
         'framework': 'Agent Framework - Common Contract & Lifecycle',
-        'workflow': 'Workflow Self-Learning & Adaptation',
         'agent-brain': 'Agent Brain - Autonomous Intelligence',
         'about': 'Agent v2 Architecture'
     };
@@ -1276,12 +1242,41 @@
     // ── API helpers ─────────────────────────────────────────────────────────
     // API_BASE: where the agent backend lives.
     //   "" (default) = same address as this page (normal setup: page served by the agent).
-    //   If you embedded this page inside another site/portal, set it to the agent, e.g.
-    //   const API_BASE = "http://your-server-ip:8000";
-    //   (Note: browsers block https:// pages calling http:// backends - serve
-    //   the agent behind HTTPS or the same origin in that case.)
-    const API_BASE = "";
-    function apiUrl(path) { return API_BASE + path; }
+    //   Embedded in another site/portal? Append ?api=AGENT_URL to the page URL once,
+    //   e.g. .../index.html?api=http://your-server-ip:8000 - it is remembered
+    //   (localStorage). You can also hardcode: const API_BASE_DEFAULT = "http://...:8000";
+    //   (Note: browsers block https:// pages calling http:// backends - expose
+    //   the agent behind HTTPS or proxy it through the same origin in that case.)
+    const API_BASE_DEFAULT = "";
+    function apiBase() {
+        try {
+            const q = new URLSearchParams(location.search).get('api');
+            if (q) { try { localStorage.setItem('agent_api_base', q); } catch (e) {} return q.replace(/\/$/, ''); }
+            const s = localStorage.getItem('agent_api_base');
+            if (s) return s.replace(/\/$/, '');
+        } catch (e) {}
+        return API_BASE_DEFAULT;
+    }
+    const API_BASE = apiBase();
+    // API_PATH_PREFIX: sub-path the portal forwards to this backend, e.g. "/agent-api".
+    // Same value as AGENT_API_PREFIX on the server. "" = root (default).
+    // Can also be set per-load via ?apipath=/agent-api (remembered like ?api=).
+    const API_PATH_PREFIX_DEFAULT = "";
+    function normPrefix(p) {
+        p = (p || '').trim().replace(/\/+$/g, '');
+        if (!p) return '';
+        return p.startsWith('/') ? p : '/' + p;
+    }
+    function apiPathPrefix() {
+        try {
+            const q = new URLSearchParams(location.search).get('apipath');
+            if (q !== null) { const v = normPrefix(q); try { localStorage.setItem('agent_api_path', v); } catch (e) {} return v; }
+            return normPrefix(localStorage.getItem('agent_api_path'));
+        } catch (e) {}
+        return API_PATH_PREFIX_DEFAULT;
+    }
+    const API_PATH_PREFIX = apiPathPrefix();
+    function apiUrl(path) { return API_BASE + API_PATH_PREFIX + path; }
     async function apiGet(url) {
         const r = await fetch(apiUrl(url), { headers: authHeaders() });
         if (r.status === 401) { clearAuth(); location.reload(); return; }
@@ -1337,7 +1332,6 @@
         else if (viewId === 'multi-agent') loadMultiAgent();
         else if (viewId === 'framework') loadFramework();
         else if (viewId === 'agent-brain') loadAgentBrain();
-        else if (viewId === 'workflow') loadWorkflows();
         else if (viewId === 'new-analysis') loadNewAnalysisPanel();
     }
     window.addEventListener('popstate', e => switchView((e.state && e.state.view) || 'start'));
@@ -1935,7 +1929,11 @@
 
               <div id="dash-content"></div>`;
 
-            // ── Render Chart.js charts ──
+            // ── Render Chart.js charts (skipped if CDN unreachable) ──
+            if (!window.Chart) {
+                const dc = document.getElementById('dash-content');
+                if (dc) dc.innerHTML = '<div class="form-hint">Charts unavailable offline - data table above still works.</div>';
+            } else {
             const chartFont = { family: "'Plus Jakarta Sans', sans-serif", size: 11 };
             const gridColor = 'rgba(255,255,255,.06)';
             Chart.defaults.color = '#94a3b8';
@@ -1992,6 +1990,8 @@
                     options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'top', labels: { usePointStyle: true, pointStyle: 'circle', padding: 12 } } }, scales: { y: { min: 0, max: 100, grid: { color: gridColor } }, x: { grid: { display: false }, ticks: { maxRotation: 45 } } } }
                 });
             }
+
+            } // end else (window.Chart available)
 
             if (currentAnalysis) renderDashboard(currentAnalysis);
         } catch (e) { body.innerHTML = '<div class="empty-state">Failed to load dashboard: ' + esc(e.message) + '</div>'; }
@@ -4021,8 +4021,10 @@
             startSpecs = a.spec_workflows || {};
             startActiveWf = a.workflow_id || 'brand_visibility_standard';
             const wsel = document.getElementById('start-workflow');
-            wsel.innerHTML = Object.keys(startSpecs).map(k =>
-                `<option value="${k}"${k === startActiveWf ? ' selected' : ''}>${esc(startSpecs[k].name)}</option>`).join('');
+            if (wsel) {
+                wsel.innerHTML = Object.keys(startSpecs).map(k =>
+                    `<option value="${k}"${k === startActiveWf ? ' selected' : ''}>${esc(startSpecs[k].name)}</option>`).join('');
+            }
             renderStartDiagram();
         } catch (e) {}
         await startRefreshLive();
@@ -4039,7 +4041,7 @@
         const wid = (wsel && wsel.value) || startActiveWf;
         const spec = startSpecs[wid];
         const el = document.getElementById('start-diagram');
-        if (!spec) { el.innerHTML = '<div class="form-hint">Select a workflow.</div>'; return; }
+        if (!spec) { el.innerHTML = '<div class="form-hint">No workflow configured.</div>'; return; }
         el.innerHTML = '<strong>' + esc(spec.name) + '</strong><div style="margin-top:8px;">' +
             spec.visible.map((s, i) =>
                 (i > 0 ? '<span style="color:var(--accent-blue);font-weight:800;"> → </span>' : '') +
@@ -4097,7 +4099,8 @@
 
     async function startRunCompany() {
         const cid = document.getElementById('start-company').value;
-        const wid = document.getElementById('start-workflow').value || startActiveWf;
+        const wsel = document.getElementById('start-workflow');
+        const wid = (wsel && wsel.value) || startActiveWf;
         if (!cid) { showToast('Select a company first.', 'error'); return; }
         const btn = document.getElementById('start-run-btn');
         btn.disabled = true; btn.innerText = 'Running…';
@@ -4426,14 +4429,28 @@
 
     // ── Init ────────────────────────────────────────────────────────────────
     document.addEventListener('DOMContentLoaded', async () => {
-        if (await checkAuth()) {
-            document.getElementById('login-screen').style.display = 'none';
-            document.getElementById('app-main').style.display = '';
-            initApp();
-        } else {
-            document.getElementById('login-screen').style.display = 'flex';
-            document.getElementById('app-main').style.display = 'none';
+        // Auto-login bypass for now
+        let backendOk = false;
+        try {
+            const r = await fetch(apiUrl('/api/login'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username: 'admin', password: 'changeme123' })
+            });
+            const j = await r.json();
+            if (j.success && j.token) {
+                setAuth(j.token);
+                backendOk = true;
+            }
+        } catch (e) { backendOk = false; }
+        document.getElementById('login-screen').style.display = 'none';
+        document.getElementById('app-main').style.display = '';
+        if (!backendOk) {
+            const where = API_BASE || (location.origin + ' (same-origin - page is embedded, agent URL not set)');
+            setTimeout(() => showToast('Cannot reach the agent backend at ' + where +
+                '. Open this page with ?api=YOUR_AGENT_URL (e.g. ?api=http://server-ip:8000).', 'error'), 500);
         }
+        initApp();
     });
 </script>
 </body>

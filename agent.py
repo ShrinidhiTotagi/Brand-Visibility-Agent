@@ -64,7 +64,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agent")
 
-CORS_ALLOWED = {"http://localhost:8000", "http://127.0.0.1:8000", "http://88.150.227.117:8000"}
+CORS_ALLOWED = {"http://localhost:8000", "http://127.0.0.1:8000", "http://88.150.227.117:8000",
+                "https://myblocks.in:11300", "https://myblocks.in", "http://myblocks.in:11300"}
+for _o in os.environ.get("AGENT_CORS_ORIGINS", "").split(","):
+    _o = _o.strip()
+    if _o:
+        CORS_ALLOWED.add(_o)
+
+# ---------------------------------------------------------------------------
+# API PATH PREFIX (for portals that forward only a sub-path to this backend).
+# e.g. AGENT_API_PREFIX=/agent-api  ->  backend answers /agent-api/companies
+# for a request path of /agent-api/companies. Default "" = serve at root.
+# ---------------------------------------------------------------------------
+API_PREFIX = os.environ.get("AGENT_API_PREFIX", "").rstrip("/")
+
+def _strip_prefix(path):
+    """Strip API_PREFIX so internal routing always sees root-relative paths."""
+    if API_PREFIX and (path == API_PREFIX or path.startswith(API_PREFIX + "/")):
+        return path[len(API_PREFIX):] or "/"
+    return path
+
+# ---------------------------------------------------------------------------
+# DATABASE CONFIGURATION
+# ---------------------------------------------------------------------------
+DB_PATH = os.environ.get("AGENT_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_storage.db"))
 
 # ---------------------------------------------------------------------------
 # SECURITY: JWT AUTH
@@ -122,13 +145,8 @@ def _verify_token(token):
 
 def _extract_user(handler):
     """Extract authenticated user from request headers. Returns (user_dict, error_response, status_code)."""
-    auth = handler.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        token = auth[7:]
-        payload = _verify_token(token)
-        if payload:
-            return {"user": payload["user"], "role": payload.get("role", "admin")}, None, 200
-    return None, {"error": "Unauthorized"}, 401
+    # Login disabled for now - allow all requests
+    return {"user": "admin", "role": "admin"}, None, 200
 
 # ---------------------------------------------------------------------------
 # SECURITY: RATE LIMITER
@@ -284,6 +302,7 @@ def _cors_headers(handler, origin=None):
 # OPTIONAL INTEGRATIONS (disable gracefully when not connected)
 # ---------------------------------------------------------------------------
 # Credentials come from environment / .env (never committed to git).
+# LOCAL SERVER COPY ONLY - uncommitted. Strip before any git push.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 
@@ -351,7 +370,7 @@ except ImportError:
     print("[requests] NOT CONNECTED - 'requests' package missing.", flush=True)
 
 # ── Groq (free tier: 14,400 req/day) ──────────────────────────────────────
-# Key from environment / .env (never committed).
+# Key from environment / .env (LOCAL SERVER COPY ONLY - uncommitted).
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = "qwen/qwen3.8-27b"
 groq_client = None
@@ -568,8 +587,7 @@ class DatabaseManager:
         self.db_password = "hwTU!*83"
         self.db_name = "temp"
         self.mode = "mysql" if os.environ.get("AGENT_DB", "sqlite") == "mysql" else "sqlite"
-        self.sqlite_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "agent_storage.db")
+        self.sqlite_path = DB_PATH
         self.flavor = self.mode
         self._pool = []
 
@@ -1430,6 +1448,22 @@ def init_db():
             db.execute(_mysqlize_ddl(ddl))
         except Exception as e:
             print(f"[Schema] create {table_name} failed: {e}", flush=True)
+
+    # Hot-path indexes (list views + per-company lookups). Idempotent.
+    for idx_sql in (
+        "CREATE INDEX IF NOT EXISTS idx_evidence_brand ON evidence (brand_id)",
+        "CREATE INDEX IF NOT EXISTS idx_obs_brand ON ai_observations (brand_id)",
+        "CREATE INDEX IF NOT EXISTS idx_results_brand ON analysis_results (brand_id)",
+        "CREATE INDEX IF NOT EXISTS idx_queries_brand ON query_memory (brand_id)",
+        "CREATE INDEX IF NOT EXISTS idx_changes_brand ON change_log (brand_id)",
+        "CREATE INDEX IF NOT EXISTS idx_recs_brand ON recommendations (brand_id)",
+        "CREATE INDEX IF NOT EXISTS idx_wfruns_company ON workflow_runs (company_id)",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status)",
+    ):
+        try:
+            db.execute(idx_sql)
+        except Exception:
+            pass
 
     if db.flavor == "mysql":
         try:
@@ -14264,6 +14298,29 @@ def discovery_summary():
             "note": "Counts reflect discovered candidates only - not full market coverage."}
 
 
+def _parse_model_json_list(text):
+    """Parse an LLM JSON array tolerantly: strict parse, then control-char
+    tolerant parse, then cut-to-last-complete-object repair. Raises on failure."""
+    cleaned = clean_json_text(text)
+    try:
+        data = json.loads(cleaned)
+    except Exception:
+        try:
+            # strict=False allows literal newlines/tabs inside strings.
+            data = json.loads(cleaned, strict=False)
+        except Exception:
+            # Repair truncated output: drop the partial tail object, close array.
+            last = cleaned.rfind("},")
+            if last == -1:
+                last = cleaned.rfind("}")
+            if last == -1:
+                raise
+            data = json.loads(cleaned[:last + 1] + "]", strict=False)
+    if not isinstance(data, list):
+        raise ValueError("not a JSON array")
+    return data
+
+
 def run_company_discovery(payload):
     industry = (payload.get("industry") or "").strip()
     region = (payload.get("region") or "").strip()
@@ -14290,10 +14347,13 @@ def run_company_discovery(payload):
            "No explanation.")
     )
     try:
-        text, model_used = _gemini_complete(prompt, max_tokens=800, temperature=0.5)
-        data = json.loads(clean_json_text(text))
-        if not isinstance(data, list):
-            return {"success": False, "status": "Invalid discovery response format", "candidates": 0}
+        text, model_used = _gemini_complete(prompt, max_tokens=1500, temperature=0.5)
+        try:
+            data = _parse_model_json_list(text)
+        except Exception:
+            # One retry: transient truncation/malformed output is common on free tier.
+            text, model_used = _gemini_complete(prompt, max_tokens=1500, temperature=0.7)
+            data = _parse_model_json_list(text)
     except Exception as e:
         msg = str(e)
         if "429" in msg or "rate_limit" in msg.lower():
@@ -14630,7 +14690,7 @@ class AgentServerHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        path = parsed.path
+        path = _strip_prefix(parsed.path)
         qp = parse_qs(parsed.query)
         origin = self.headers.get("Origin", "")
         client_ip = self.client_address[0]
@@ -14780,6 +14840,9 @@ class AgentServerHandler(BaseHTTPRequestHandler):
                     send_error(self, "invalid company id", 400)
                     return
                 send_json(self, company_intelligence(cid))
+            elif path in ("/api/companies", "/api/companies/"):
+                # Alias for the Autonomous Loop company selector (expects {companies: [...]}).
+                send_json(self, {"success": True, "companies": fetch_companies()})
             elif path == "/api/agent/autonomous/status":
                 send_json(self, autonomous_status())
             elif path == "/api/orchestrator/state":
@@ -15338,7 +15401,7 @@ class AgentServerHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        path = parsed.path
+        path = _strip_prefix(parsed.path)
         origin = self.headers.get("Origin", "")
         client_ip = self.client_address[0]
 
@@ -15348,27 +15411,15 @@ class AgentServerHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            # Public: login endpoint
+            # Public: login endpoint - bypassed for now
             if path == "/api/login":
                 data = read_body(self)
-                username = data.get("username", "")
-                password = data.get("password", "")
-                tu = authenticate_tenant_user(username, password)
-                if tu:
-                    token = _create_token(username, tu["role"], tu["tenant_id"], tu["tenant_slug"])
-                    logger.info(f"Login: {username} (tenant: {tu['tenant_slug']})")
-                    send_json(self, {"success": True, "token": token, "user": username, "role": tu["role"],
-                                     "tenant": {"slug": tu["tenant_slug"], "name": tu["tenant_name"],
-                                                "logo_url": tu.get("logo_url", ""), "primary_color": tu.get("primary_color", "#3b82f6")}})
-                    return
-                # Fallback to legacy user
-                user_rec = _users.get(username)
-                if user_rec and user_rec["password_hash"] == _hash_password(password):
-                    token = _create_token(username, user_rec["role"])
-                    logger.info(f"Login: {username} (legacy)")
-                    send_json(self, {"success": True, "token": token, "user": username, "role": user_rec["role"]})
-                    return
-                send_json(self, {"error": "Invalid credentials"}, 401)
+                username = data.get("username", "admin")
+                # Always succeed, no credential check
+                token = _create_token(username, "admin")
+                logger.info(f"Login bypassed for {username}")
+                send_json(self, {"success": True, "token": token, "user": username, "role": "admin",
+                                 "tenant": {"slug": "default", "name": "Default", "logo_url": "", "primary_color": "#3b82f6"}})
                 return
 
             # Auth required for all other POST endpoints
@@ -15981,7 +16032,7 @@ class AgentServerHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/delete-audit":
+        if _strip_prefix(parsed.path) == "/delete-audit":
             qp = parse_qs(parsed.query)
             aid = (qp.get("id") or [None])[0]
             if aid:
@@ -16138,11 +16189,19 @@ def delete_audit(audit_id):
 def fetch_companies():
     rows = db.query("""
         SELECT b.*,
-          (SELECT COUNT(*) FROM evidence e WHERE e.brand_id = b.id) AS evidence_count,
-          (SELECT COUNT(*) FROM ai_observations o WHERE o.brand_id = b.id) AS observations_count,
-          (SELECT r.visibility_score FROM analysis_results r WHERE r.brand_id = b.id ORDER BY r.id DESC LIMIT 1) AS last_score,
-          (SELECT r.observed_score FROM analysis_results r WHERE r.brand_id = b.id ORDER BY r.id DESC LIMIT 1) AS last_observed_score
-        FROM brands b ORDER BY b.id DESC
+          COALESCE(e.cnt, 0) AS evidence_count,
+          COALESCE(o.cnt, 0) AS observations_count,
+          r.visibility_score AS last_score,
+          r.observed_score AS last_observed_score
+        FROM brands b
+        LEFT JOIN (SELECT brand_id, COUNT(*) AS cnt FROM evidence GROUP BY brand_id) e
+          ON e.brand_id = b.id
+        LEFT JOIN (SELECT brand_id, COUNT(*) AS cnt FROM ai_observations GROUP BY brand_id) o
+          ON o.brand_id = b.id
+        LEFT JOIN (SELECT brand_id, MAX(id) AS max_id FROM analysis_results GROUP BY brand_id) rm
+          ON rm.brand_id = b.id
+        LEFT JOIN analysis_results r ON r.id = rm.max_id
+        ORDER BY b.id DESC
     """)
     return [dict(r) for r in rows]
 
@@ -16373,7 +16432,7 @@ def _get_api_docs():
 # SERVER START
 # ---------------------------------------------------------------------------
 
-def start_server(port=8000):
+def start_server(port=8000, ssl_cert=None, ssl_key=None):
     print("=" * 60, flush=True)
     print("AI Search Brand Visibility Autonomous Intelligence Agent  v2", flush=True)
     print("=" * 60, flush=True)
@@ -16394,7 +16453,19 @@ def start_server(port=8000):
     global _server_start_time
     _server_start_time = time.time()
     server = ThreadingHTTPServer(("", port), AgentServerHandler)
-    print(f"Running at: http://localhost:{port}", flush=True)
+    scheme = "http"
+    if ssl_cert and ssl_key:
+        try:
+            import ssl as _ssl
+            _ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+            _ctx.load_cert_chain(ssl_cert, ssl_key)
+            server.socket = _ctx.wrap_socket(server.socket, server_side=True)
+            scheme = "https"
+            print(f"TLS enabled with cert {ssl_cert}", flush=True)
+        except Exception as e:
+            print(f"[Fatal] TLS setup failed: {e}", flush=True)
+            raise
+    print(f"Running at: {scheme}://localhost:{port}", flush=True)
     print(f"Agent state: http://localhost:{port}/agent-state", flush=True)
     print(f"Manual analysis: POST /run-agent", flush=True)
     print("Press Ctrl+C to stop.", flush=True)
@@ -17977,18 +18048,31 @@ _wf_init_tables()
 if __name__ == "__main__":
     # Port: --port 9000 arg wins, else PORT env, else 8000.
     # e.g.  python agent.py --port 11301   |   PORT=11301 python agent.py
+    # TLS: --ssl-cert cert.pem --ssl-key key.pem (or SSL_CERT / SSL_KEY env).
+    # e.g.  python agent.py --port 11301 --ssl-cert /etc/ssl/myblocks.crt --ssl-key /etc/ssl/myblocks.key
     port = 8000
+    ssl_cert = os.environ.get("SSL_CERT", "")
+    ssl_key = os.environ.get("SSL_KEY", "")
     try:
         import sys as _sys
-        for _i, _a in enumerate(_sys.argv[1:]):
-            if _a == "--port" and _i + 2 <= len(_sys.argv[1:]):
-                port = int(_sys.argv[1:][_i + 1])
+        _args = _sys.argv[1:]
+        for _i, _a in enumerate(_args):
+            if _a == "--port" and _i + 1 < len(_args):
+                port = int(_args[_i + 1])
             elif _a.startswith("--port="):
                 port = int(_a.split("=", 1)[1])
-        if "--port" not in _sys.argv[1:] and not any(a.startswith("--port=") for a in _sys.argv[1:]):
+            elif _a == "--ssl-cert" and _i + 1 < len(_args):
+                ssl_cert = _args[_i + 1]
+            elif _a.startswith("--ssl-cert="):
+                ssl_cert = _a.split("=", 1)[1]
+            elif _a == "--ssl-key" and _i + 1 < len(_args):
+                ssl_key = _args[_i + 1]
+            elif _a.startswith("--ssl-key="):
+                ssl_key = _a.split("=", 1)[1]
+        if not any(a == "--port" or a.startswith("--port=") for a in _args):
             port = int(os.environ.get("PORT", "8000"))
     except Exception:
         port = 8000
-    start_server(port)
+    start_server(port, ssl_cert or None, ssl_key or None)
 
 
